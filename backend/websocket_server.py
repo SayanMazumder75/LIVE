@@ -33,17 +33,23 @@ Each browser tab gets its own AssemblyAI session, opened on "start" and
 closed on "stop" (or when the websocket drops). The API key never leaves
 the server.
 
-Translation (optional, enabled by setting `GEMINI_API_KEY`) runs in a
-fire-and-forget background task per finalized transcript. It never
-blocks transcripts and never modifies them — translations arrive as
-their own message frame keyed to the transcript's `id`.
+Translation policy
+------------------
+This server uses TWO independent APIs with TWO non-overlapping jobs:
 
-The "translate" control message is for clients that did the speech-to-
-text themselves (e.g. browser Web Speech API for Hindi, since AAI's
-streaming model doesn't yet support Hindi). The server treats it as a
-standalone "please translate this text" request — it does NOT echo back
-a transcript frame, only the translation. The browser is expected to
-have already rendered the original line with `id` locally.
+    AssemblyAI key  →  English speech  →  English text
+    Gemini key      →  Hindi   text    →  English text
+
+We deliberately do NOT call Gemini on AssemblyAI's English finals — AAI
+already returns clean English, and a Gemini round-trip would just burn
+free-tier quota. The only path that talks to Gemini is the explicit
+`{type:"translate", id, text}` control message, used by Hindi mode
+where the browser does the speech-to-text itself with the Web Speech
+API.
+
+When Gemini returns a real failure (most commonly HTTP 429 rate limit),
+the server forwards a `{type:"error", message:...}` frame so the user
+sees *why* a translation didn't appear instead of silently missing.
 """
 
 from __future__ import annotations
@@ -59,7 +65,7 @@ from urllib.parse import urlencode
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from translator import Translator
+from translator import Translator, TranslationResult
 
 logger = logging.getLogger("websocket_server")
 
@@ -122,13 +128,14 @@ def _aai_connect_kwargs(api_key: str) -> dict:
 # --------------------------------------------------------------------------
 
 
-async def _forward_aai_to_client(
-    aai_ws,
-    client_ws,
-    translator: Translator,
-    translation_tasks: "set[asyncio.Task]",
-) -> None:
-    """Translate AssemblyAI events into the browser-facing protocol."""
+async def _forward_aai_to_client(aai_ws, client_ws) -> None:
+    """
+    Translate AssemblyAI events into the browser-facing protocol.
+
+    AAI handles English natively, so we forward its finals straight
+    through. **No Gemini round-trip happens here.** Translation only
+    runs on explicit `{type:"translate"}` requests from the client.
+    """
     try:
         async for raw in aai_ws:
             if isinstance(raw, (bytes, bytearray)):
@@ -179,11 +186,9 @@ async def _forward_aai_to_client(
                     continue
 
                 # End of turn. With format_turns=true AAI emits two
-                # end-of-turn frames (unformatted then formatted). Forward
-                # only the formatted one to avoid duplicate appended
-                # lines. As a safety net, if for some reason only the
-                # unformatted version arrives, we still want the user to
-                # see something.
+                # end-of-turn frames (unformatted then formatted). Only
+                # forward the formatted one to avoid duplicate appended
+                # lines.
                 if formatted:
                     transcript_id = uuid.uuid4().hex[:12]
                     await _send_json(
@@ -195,18 +200,6 @@ async def _forward_aai_to_client(
                             "id": transcript_id,
                         },
                     )
-                    # Fire-and-forget translation. Never blocks the
-                    # transcript path; if it fails, the original line
-                    # still stands on its own.
-                    if translator.enabled:
-                        task = asyncio.create_task(
-                            _translate_and_send(
-                                translator, client_ws, transcript_id, transcript
-                            ),
-                            name=f"translate-{transcript_id}",
-                        )
-                        translation_tasks.add(task)
-                        task.add_done_callback(translation_tasks.discard)
                 # Unformatted finals are skipped; the formatted version
                 # follows shortly.
                 continue
@@ -243,35 +236,50 @@ async def _translate_and_send(
     text: str,
 ) -> None:
     """
-    Run a translation in the background and post it back to the browser.
-    Errors are logged but never propagated — translation is best-effort.
+    Run a Gemini translation in the background and post the result back
+    to the browser. Never raises.
+
+    Outcome handling:
+    - success: emit {type:"translation", id, text, source_text}
+    - real failure (e.g. 429): emit {type:"error", message:...} so the
+      user sees a clear cause instead of a silently missing translation
+    - blank input or disabled translator: do nothing
     """
+    result: TranslationResult
     try:
-        translated = await translator.translate(text)
+        result = await translator.translate(text)
     except Exception:  # noqa: BLE001
         logger.exception("translator raised; skipping translation")
         return
 
-    if not translated:
+    if result.text:
+        translated = result.text
+        # Defensive: if Gemini returned the input unchanged (the user
+        # spoke English in Hindi mode by mistake, for instance), don't
+        # add a no-op "translation" line.
+        if translated.strip().lower() == text.strip().lower():
+            return
+        logger.info("translation: id=%s text=%r", transcript_id, translated)
+        await _send_json(
+            client_ws,
+            {
+                "type": "translation",
+                "id": transcript_id,
+                "text": translated,
+                "source_text": text,
+            },
+        )
         return
 
-    # Skip when the translator returned the same text — the user spoke
-    # English and the prompt told the model to leave it alone. Comparing
-    # case-insensitively trimmed avoids spurious "translations" that just
-    # rephrase whitespace or capitalization.
-    if translated.strip().lower() == text.strip().lower():
+    if result.error:
+        # Real failure (rate limit, auth, network, safety). Surface it.
+        await _send_json(
+            client_ws,
+            {"type": "error", "message": f"Translation: {result.error}"},
+        )
         return
 
-    logger.info("translation: id=%s text=%r", transcript_id, translated)
-    await _send_json(
-        client_ws,
-        {
-            "type": "translation",
-            "id": transcript_id,
-            "text": translated,
-            "source_text": text,
-        },
-    )
+    # Otherwise translator was disabled or input was blank — silent no-op.
 
 
 # --------------------------------------------------------------------------
@@ -290,20 +298,15 @@ async def _open_aai(api_key: str):
         return await websockets.connect(url, **kwargs)
 
 
-async def _run_session(
-    client_ws,
-    api_key: str,
-    translator: Translator,
-) -> None:
+async def _run_session(client_ws, api_key: str) -> None:
     """
     Open one AssemblyAI session for the connected browser, pump audio
     through it, and stream transcripts back. Returns when the session
     ends (client disconnects, sends `stop`, or AAI terminates).
 
-    `translator` is provided by the caller so locally-recognized
-    transcripts (e.g. Hindi via the browser's Web Speech API) can share
-    the same Gemini configuration without opening a separate AAI
-    session.
+    AAI handles English transcription only — Gemini is **not** invoked
+    here. Translations are dispatched separately from the outer
+    `_handler` when the client sends an explicit `{type:"translate"}`.
     """
     try:
         aai_ws = await _open_aai(api_key)
@@ -317,12 +320,8 @@ async def _run_session(
 
     await _send_json(client_ws, {"type": "status", "status": "ready"})
 
-    # Tracks in-flight background translation tasks so we can clean them
-    # up when the session ends.
-    translation_tasks: "set[asyncio.Task]" = set()
-
     forwarder = asyncio.create_task(
-        _forward_aai_to_client(aai_ws, client_ws, translator, translation_tasks),
+        _forward_aai_to_client(aai_ws, client_ws),
         name="aai-forwarder",
     )
 
@@ -370,7 +369,11 @@ async def _run_session(
                 # a second AAI socket for the same browser tab.
                 logger.debug("ignoring 'start' while already streaming")
                 continue
-            # Other control messages are ignored mid-session.
+            # Other control messages (including 'translate') are ignored
+            # mid-session; the outer handler picks them up after this
+            # session returns. Hindi mode and English mode are mutually
+            # exclusive in the UI anyway, so this never matters in
+            # practice.
     except ConnectionClosed:
         pass
     finally:
@@ -389,22 +392,6 @@ async def _run_session(
             await forwarder
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
-
-        # Drain any in-flight translation tasks. Give them a brief grace
-        # period so a slow Gemini response can still reach the browser
-        # before we declare the session stopped, then cancel the rest.
-        if translation_tasks:
-            try:
-                await asyncio.wait(
-                    list(translation_tasks),
-                    timeout=2.0,
-                    return_when=asyncio.ALL_COMPLETED,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            for t in list(translation_tasks):
-                if not t.done():
-                    t.cancel()
 
     await _send_json(client_ws, {"type": "status", "status": "stopped"})
 
@@ -426,9 +413,8 @@ async def _handler(client_ws) -> None:
     translator = Translator()
 
     # In-flight background translations triggered by "translate"
-    # control messages outside of any AAI session. Cleaned up on
-    # client disconnect.
-    standalone_translations: "set[asyncio.Task]" = set()
+    # control messages. Cleaned up on client disconnect.
+    translation_tasks: "set[asyncio.Task]" = set()
 
     await _send_json(client_ws, {"type": "status", "status": "connected"})
 
@@ -465,13 +451,14 @@ async def _handler(client_ws) -> None:
                         },
                     )
                     continue
-                await _run_session(client_ws, api_key, translator)
+                await _run_session(client_ws, api_key)
             elif ctype == "stop":
                 # No active session; nothing to do.
                 continue
             elif ctype == "translate":
-                # Standalone translation request — used by Hindi mode
-                # where the browser does the recognition itself.
+                # Hindi-mode standalone translation request — the browser
+                # has already done the speech-to-text and is asking us
+                # only for the Hindi -> English step.
                 text = (ctrl.get("text") or "").strip()
                 msg_id = ctrl.get("id")
                 if not text or not isinstance(msg_id, str) or not msg_id:
@@ -488,10 +475,10 @@ async def _handler(client_ws) -> None:
                     continue
                 task = asyncio.create_task(
                     _translate_and_send(translator, client_ws, msg_id, text),
-                    name=f"standalone-translate-{msg_id}",
+                    name=f"translate-{msg_id}",
                 )
-                standalone_translations.add(task)
-                task.add_done_callback(standalone_translations.discard)
+                translation_tasks.add(task)
+                task.add_done_callback(translation_tasks.discard)
             else:
                 continue
     except ConnectionClosed:
@@ -499,18 +486,18 @@ async def _handler(client_ws) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("client handler crashed")
     finally:
-        # Drain any in-flight standalone translations briefly so the
-        # client gets the last few results, then cancel the rest.
-        if standalone_translations:
+        # Drain any in-flight translations briefly so the client gets
+        # the last few results, then cancel the rest.
+        if translation_tasks:
             try:
                 await asyncio.wait(
-                    list(standalone_translations),
+                    list(translation_tasks),
                     timeout=1.0,
                     return_when=asyncio.ALL_COMPLETED,
                 )
             except Exception:  # noqa: BLE001
                 pass
-            for t in list(standalone_translations):
+            for t in list(translation_tasks):
                 if not t.done():
                     t.cancel()
         logger.info("client disconnected: %s", peer)
