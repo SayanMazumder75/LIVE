@@ -1,12 +1,15 @@
 # AI Transcriber
 
-A self-contained, no-LiveKit, browser-based speech-to-text app.
+A self-contained, no-LiveKit, browser-based speech-to-text app **with optional Hindi → English translation**.
 
 The browser captures microphone audio, streams it as 16 kHz mono PCM to a tiny
 Python WebSocket bridge, which forwards it to **AssemblyAI's Universal-Streaming
-v3** API and pipes the live transcripts back to the React UI.
+v3** API and pipes the live transcripts back to the React UI. Each finalized
+caption is also (optionally) sent to **Google's Gemini API** for Hindi → English
+translation, which is rendered underneath the original line.
 
-Only **one free API key** is needed: AssemblyAI.
+Two **free API keys** are needed for the full experience: AssemblyAI (required)
+and Gemini (optional — leave it blank to disable translation).
 
 ```
 Microphone (browser)
@@ -22,13 +25,14 @@ Browser WebSocket  ──────────►  Python bridge (ws://localh
                                        │
                                        │  Begin / Turn / Termination
                                        ▼
-                                Python bridge
-                                       │  {"type":"transcript","text":...,"final":bool}
+                                Python bridge ──► Gemini (per finalized line)
+                                       │   {"type":"transcript","text":...,"final":bool,"id":...}
+                                       │   {"type":"translation","id":...,"text":...}
                                        ▼
                                   React UI
 ```
 
-The AssemblyAI API key never leaves the server.
+Both API keys never leave the server.
 
 ## Folder structure
 
@@ -36,6 +40,7 @@ The AssemblyAI API key never leaves the server.
 backend/
 ├── main.py                # entry point — loads .env and starts the bridge
 ├── websocket_server.py    # the bridge: browser <-> AssemblyAI v3
+├── translator.py          # optional Hindi -> English via Gemini (isolated)
 ├── requirements.txt
 └── .env.example
 
@@ -58,13 +63,17 @@ frontend/
         └── useTranscriptSocket.js  # WS protocol + auto-reconnect
 ```
 
-## Get the (free) API key
+## Get the (free) API keys
 
-Sign up at <https://www.assemblyai.com/dashboard/signup>. The free tier
-includes credits that work on the Universal-Streaming endpoint — no paid plan
-required for development.
+**AssemblyAI (required)** — sign up at
+<https://www.assemblyai.com/dashboard/signup>. The free tier includes
+credits that work on the Universal-Streaming endpoint.
 
-Copy the API key from the dashboard.
+**Gemini (optional, for Hindi → English translation)** — get a free key at
+<https://aistudio.google.com/app/apikey>. The default model
+(`gemini-2.5-flash-lite`) gives 15 requests/minute and 1000 requests/day on
+the free tier — plenty for an interactive transcriber. Leave `GEMINI_API_KEY`
+blank in `.env` to disable translation entirely.
 
 ## Backend
 
@@ -79,12 +88,14 @@ cp .env.example .env
 # edit .env and paste your real ASSEMBLYAI_API_KEY
 ```
 
-`.env` only needs:
+`.env` minimally needs:
 
 ```
-ASSEMBLYAI_API_KEY=your_key
-WS_HOST=0.0.0.0       # optional
-WS_PORT=8001          # optional
+ASSEMBLYAI_API_KEY=your_assemblyai_key
+GEMINI_API_KEY=                      # optional: enables Hindi -> English translation
+GEMINI_MODEL=                        # optional: defaults to gemini-2.5-flash-lite
+WS_HOST=0.0.0.0                      # optional
+WS_PORT=8001                         # optional
 ```
 
 ### Run
@@ -108,8 +119,9 @@ Browser → server:
 
 Server → browser:
 - `{"type":"status","status":"connected" | "ready" | "stopped"}`
-- `{"type":"transcript","text":"...","final":true}` — finalized line, append.
-- `{"type":"transcript","text":"...","final":false}` — interim turn, replace.
+- `{"type":"transcript","text":"...","final":true,"id":"..."}` — finalized line; append. The `id` is a short hex string the server generates so a later translation can attach to it.
+- `{"type":"transcript","text":"...","final":false}` — interim turn; replace.
+- `{"type":"translation","id":"<final-id>","text":"...","source_text":"..."}` — Gemini translation of a previously-sent finalized line. UI attaches it to the matching final by `id`. Only sent when `GEMINI_API_KEY` is configured **and** the translation actually differs from the original (English-only finals don't generate translation frames).
 - `{"type":"error","message":"..."}`
 
 Each `start` opens one AssemblyAI session for that browser; `stop` (or a
@@ -163,13 +175,19 @@ npm run preview
    audio frames straight through.
 5. AssemblyAI emits `Turn` events. The backend translates them:
    - in-progress turns → `{"type":"transcript","final":false}`
-   - end-of-turn formatted → `{"type":"transcript","final":true}`
-6. The React UI appends finalized lines to a list and shows the current
+   - end-of-turn formatted → `{"type":"transcript","final":true,"id":...}`
+6. **(Optional)** If `GEMINI_API_KEY` is set, every finalized line also
+   triggers a fire-and-forget background task that calls Gemini, asks it to
+   translate Hindi to English (and leave English alone), and — if the
+   result differs from the original — sends back a separate
+   `{"type":"translation","id":...}` frame. The UI attaches it to the
+   matching line and renders it in muted green underneath.
+7. The React UI appends finalized lines to a list and shows the current
    in-progress turn underneath. The transcript panel auto-scrolls to the
    bottom on every change.
-7. **Stop Microphone** stops the audio tracks, closes the worklet, and
+8. **Stop Microphone** stops the audio tracks, closes the worklet, and
    sends `{"type":"stop"}`, which makes the backend gracefully terminate the
-   AssemblyAI session.
+   AssemblyAI session and drain any pending translation tasks.
 
 ## Style
 
@@ -184,6 +202,9 @@ Dark theme, exactly as specified:
 ## Notes
 
 - No LiveKit anywhere — backend or frontend.
+- Translation is **fully isolated** in `backend/translator.py`. Removing
+  `GEMINI_API_KEY` (or removing the file entirely) leaves the rest of the
+  app untouched and working.
 - The frontend reconnects to the backend WebSocket every 3 seconds if the
   connection drops, and shows **Disconnected** until it's back.
 - The backend prints a warning at startup if `ASSEMBLYAI_API_KEY` is not set,
