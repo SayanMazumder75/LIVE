@@ -23,12 +23,18 @@ Browser → server protocol
 Server → browser protocol
 -------------------------
     {"type": "status", "status": "connected" | "ready" | "stopped"}
-    {"type": "transcript", "text": "...", "final": bool}
+    {"type": "transcript", "text": "...", "final": bool, "id": "..."}
+    {"type": "translation", "id": "<matching transcript id>", "text": "..."}
     {"type": "error", "message": "..."}
 
 Each browser tab gets its own AssemblyAI session, opened on "start" and
 closed on "stop" (or when the websocket drops). The API key never leaves
 the server.
+
+Translation (optional, enabled by setting `GEMINI_API_KEY`) runs in a
+fire-and-forget background task per finalized transcript. It never
+blocks transcripts and never modifies them — translations arrive as
+their own message frame keyed to the transcript's `id`.
 """
 
 from __future__ import annotations
@@ -38,10 +44,13 @@ import json
 import logging
 import os
 import time
+import uuid
 from urllib.parse import urlencode
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+from translator import Translator
 
 logger = logging.getLogger("websocket_server")
 
@@ -104,7 +113,12 @@ def _aai_connect_kwargs(api_key: str) -> dict:
 # --------------------------------------------------------------------------
 
 
-async def _forward_aai_to_client(aai_ws, client_ws) -> None:
+async def _forward_aai_to_client(
+    aai_ws,
+    client_ws,
+    translator: Translator,
+    translation_tasks: "set[asyncio.Task]",
+) -> None:
     """Translate AssemblyAI events into the browser-facing protocol."""
     try:
         async for raw in aai_ws:
@@ -162,10 +176,28 @@ async def _forward_aai_to_client(aai_ws, client_ws) -> None:
                 # unformatted version arrives, we still want the user to
                 # see something.
                 if formatted:
+                    transcript_id = uuid.uuid4().hex[:12]
                     await _send_json(
                         client_ws,
-                        {"type": "transcript", "text": transcript, "final": True},
+                        {
+                            "type": "transcript",
+                            "text": transcript,
+                            "final": True,
+                            "id": transcript_id,
+                        },
                     )
+                    # Fire-and-forget translation. Never blocks the
+                    # transcript path; if it fails, the original line
+                    # still stands on its own.
+                    if translator.enabled:
+                        task = asyncio.create_task(
+                            _translate_and_send(
+                                translator, client_ws, transcript_id, transcript
+                            ),
+                            name=f"translate-{transcript_id}",
+                        )
+                        translation_tasks.add(task)
+                        task.add_done_callback(translation_tasks.discard)
                 # Unformatted finals are skipped; the formatted version
                 # follows shortly.
                 continue
@@ -193,6 +225,44 @@ async def _forward_aai_to_client(aai_ws, client_ws) -> None:
         pass
     except Exception:  # noqa: BLE001
         logger.exception("aai->client forwarder crashed")
+
+
+async def _translate_and_send(
+    translator: Translator,
+    client_ws,
+    transcript_id: str,
+    text: str,
+) -> None:
+    """
+    Run a translation in the background and post it back to the browser.
+    Errors are logged but never propagated — translation is best-effort.
+    """
+    try:
+        translated = await translator.translate(text)
+    except Exception:  # noqa: BLE001
+        logger.exception("translator raised; skipping translation")
+        return
+
+    if not translated:
+        return
+
+    # Skip when the translator returned the same text — the user spoke
+    # English and the prompt told the model to leave it alone. Comparing
+    # case-insensitively trimmed avoids spurious "translations" that just
+    # rephrase whitespace or capitalization.
+    if translated.strip().lower() == text.strip().lower():
+        return
+
+    logger.info("translation: id=%s text=%r", transcript_id, translated)
+    await _send_json(
+        client_ws,
+        {
+            "type": "translation",
+            "id": transcript_id,
+            "text": translated,
+            "source_text": text,
+        },
+    )
 
 
 # --------------------------------------------------------------------------
@@ -229,8 +299,16 @@ async def _run_session(client_ws, api_key: str) -> None:
 
     await _send_json(client_ws, {"type": "status", "status": "ready"})
 
+    # Optional Hindi -> English translator. Constructed per session so a
+    # configuration change (e.g. setting GEMINI_API_KEY) takes effect on
+    # the next browser tab without restarting the whole server.
+    translator = Translator()
+    # Tracks in-flight background translation tasks so we can clean them
+    # up when the session ends.
+    translation_tasks: "set[asyncio.Task]" = set()
+
     forwarder = asyncio.create_task(
-        _forward_aai_to_client(aai_ws, client_ws),
+        _forward_aai_to_client(aai_ws, client_ws, translator, translation_tasks),
         name="aai-forwarder",
     )
 
@@ -297,6 +375,22 @@ async def _run_session(client_ws, api_key: str) -> None:
             await forwarder
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+
+        # Drain any in-flight translation tasks. Give them a brief grace
+        # period so a slow Gemini response can still reach the browser
+        # before we declare the session stopped, then cancel the rest.
+        if translation_tasks:
+            try:
+                await asyncio.wait(
+                    list(translation_tasks),
+                    timeout=2.0,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            for t in list(translation_tasks):
+                if not t.done():
+                    t.cancel()
 
     await _send_json(client_ws, {"type": "status", "status": "stopped"})
 

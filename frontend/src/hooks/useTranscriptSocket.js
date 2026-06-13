@@ -16,7 +16,10 @@ const RECONNECT_DELAY_MS = 3000;
  * Returns:
  *   status        : "connected" | "disconnected"
  *   sessionStatus : "idle" | "ready" | "stopped" | "error"
- *   finals        : Array<{id, text}>     append-only finalized lines
+ *   finals        : Array<{id, text, translation: string|null}>
+ *                   append-only finalized lines; `translation` may be
+ *                   filled in later when the backend's Gemini step
+ *                   completes (or stay null if not configured / no-op).
  *   interim       : string                current in-progress turn
  *   error         : string | null
  *
@@ -79,19 +82,33 @@ export function useTranscriptSocket(url) {
 
         if (msg.type === "transcript" && typeof msg.text === "string") {
           if (msg.final) {
+            // Prefer the server-provided id so translation frames can
+            // attach to the right line. Fall back to a local id only
+            // if the server didn't send one (older backends).
+            const id =
+              typeof msg.id === "string" && msg.id
+                ? msg.id
+                : `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
             setFinals((prev) => [
               ...prev,
-              {
-                id: `${Date.now()}-${prev.length}-${Math.random()
-                  .toString(36)
-                  .slice(2, 7)}`,
-                text: msg.text,
-              },
+              { id, text: msg.text, translation: null },
             ]);
             setInterim("");
           } else {
             setInterim(msg.text);
           }
+        } else if (
+          msg.type === "translation" &&
+          typeof msg.id === "string" &&
+          typeof msg.text === "string"
+        ) {
+          // Attach the translation to the matching finalized line.
+          // No-op if the line is gone (e.g. user clicked Clear).
+          setFinals((prev) =>
+            prev.map((line) =>
+              line.id === msg.id ? { ...line, translation: msg.text } : line
+            )
+          );
         } else if (msg.type === "status" && typeof msg.status === "string") {
           setSessionStatus(msg.status);
           if (msg.status === "stopped") setInterim("");
