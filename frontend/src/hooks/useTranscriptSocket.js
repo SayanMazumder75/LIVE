@@ -13,6 +13,17 @@ const RECONNECT_DELAY_MS = 3000;
  * mode (where effects mount → cleanup → mount in quick succession) and
  * under genuine reconnects.
  *
+ * Dev-mode WebSocket warning
+ * --------------------------
+ * The very first WebSocket creation is deferred via `setTimeout(0)` so
+ * StrictMode's mount → cleanup → mount cycle (which runs synchronously)
+ * happens *before* the connection actually starts. Without this, Chrome
+ * logs "WebSocket is closed before the connection is established"
+ * because the still-CONNECTING first socket gets cancelled in cleanup.
+ * The warning is harmless but noisy; the deferred connect eliminates
+ * it. In production builds StrictMode doesn't double-invoke effects, so
+ * this `setTimeout(0)` is a no-op there.
+ *
  * Returns:
  *   status        : "connected" | "disconnected"
  *   sessionStatus : "idle" | "ready" | "stopped" | "error"
@@ -24,6 +35,13 @@ const RECONNECT_DELAY_MS = 3000;
  *   error         : string | null
  *
  *   startSession() / stopSession() / sendAudio(buffer) / clearTranscripts()
+ *
+ * Hindi-mode helpers (used when the browser does the recognition
+ * locally because AAI doesn't support the language):
+ *   addLocalFinal(text)       — append a finalized line, returns its id
+ *   setLocalInterim(text)     — overwrite the current in-progress line
+ *   requestTranslation(id, t) — ask the backend to translate `t` and
+ *                                attach the result to the line `id`
  */
 export function useTranscriptSocket(url) {
   const [status, setStatus] = useState("disconnected");
@@ -39,6 +57,9 @@ export function useTranscriptSocket(url) {
     let destroyed = false;
     let currentWs = null;
     let reconnectTimer = null;
+    let initialConnectScheduled = false;
+
+    let connect = () => {};
 
     const scheduleReconnect = () => {
       if (destroyed || reconnectTimer) return;
@@ -48,7 +69,7 @@ export function useTranscriptSocket(url) {
       }, RECONNECT_DELAY_MS);
     };
 
-    const connect = () => {
+    const wrappedConnect = () => {
       if (destroyed) return;
 
       let ws;
@@ -140,10 +161,27 @@ export function useTranscriptSocket(url) {
       };
     };
 
-    connect();
+    connect = wrappedConnect;
+
+    // Defer the very first connect by a setTimeout(0) so StrictMode's
+    // dev-mode mount → cleanup → mount cycle (which runs synchronously)
+    // happens *before* we open a WebSocket. Without this delay, the
+    // first WebSocket would be cancelled mid-handshake during cleanup,
+    // and Chrome would log a benign but noisy "WebSocket is closed
+    // before the connection is established" warning. In production
+    // (no StrictMode double-invoke) this is just a one-tick delay.
+    const initialConnectTimer = setTimeout(() => {
+      initialConnectScheduled = false;
+      if (destroyed) return;
+      connect();
+    }, 0);
+    initialConnectScheduled = true;
 
     return () => {
       destroyed = true;
+      if (initialConnectScheduled) {
+        clearTimeout(initialConnectTimer);
+      }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -185,6 +223,37 @@ export function useTranscriptSocket(url) {
     setInterim("");
   }, []);
 
+  // --- Hindi-mode helpers --------------------------------------------------
+  // These let the UI inject locally-recognized transcripts (e.g. from the
+  // browser's Web Speech API) into the same `finals` / `interim` state that
+  // backend transcripts use, so the rendering layer doesn't have to know
+  // where the text came from. Translations are still requested via the
+  // server (`requestTranslation`) and arrive over the existing message
+  // channel as `{type:"translation", id, text}`.
+
+  const addLocalFinal = useCallback((text) => {
+    const trimmed = (text || "").trim();
+    if (!trimmed) return null;
+    const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setFinals((prev) => [
+      ...prev,
+      { id, text: trimmed, translation: null },
+    ]);
+    setInterim("");
+    return id;
+  }, []);
+
+  const setLocalInterim = useCallback((text) => {
+    setInterim(text || "");
+  }, []);
+
+  const requestTranslation = useCallback((id, text) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!id || !text) return;
+    ws.send(JSON.stringify({ type: "translate", id, text }));
+  }, []);
+
   return {
     status,
     sessionStatus,
@@ -195,5 +264,9 @@ export function useTranscriptSocket(url) {
     stopSession,
     sendAudio,
     clearTranscripts,
+    // Hindi-mode helpers
+    addLocalFinal,
+    setLocalInterim,
+    requestTranslation,
   };
 }
