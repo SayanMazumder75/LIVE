@@ -38,16 +38,16 @@ Translation policy
 This server uses TWO independent APIs with TWO non-overlapping jobs:
 
     AssemblyAI key  →  English speech  →  English text
-    Gemini key      →  Hindi   text    →  English text
+    Groq key        →  Hindi   text    →  English text
 
-We deliberately do NOT call Gemini on AssemblyAI's English finals — AAI
-already returns clean English, and a Gemini round-trip would just burn
-free-tier quota. The only path that talks to Gemini is the explicit
+We deliberately do NOT call Groq on AssemblyAI's English finals — AAI
+already returns clean English, and an LLM round-trip would just burn
+free-tier quota. The only path that talks to Groq is the explicit
 `{type:"translate", id, text}` control message, used by Hindi mode
 where the browser does the speech-to-text itself with the Web Speech
 API.
 
-When Gemini returns a real failure (most commonly HTTP 429 rate limit),
+When Groq returns a real failure (most commonly HTTP 429 rate limit),
 the server forwards a `{type:"error", message:...}` frame so the user
 sees *why* a translation didn't appear instead of silently missing.
 """
@@ -468,7 +468,7 @@ async def _handler(client_ws) -> None:
                         client_ws,
                         {
                             "type": "error",
-                            "message": "Translation requested, but GEMINI_API_KEY "
+                            "message": "Translation requested, but GROQ_API_KEY "
                             "is not set on the server.",
                         },
                     )
