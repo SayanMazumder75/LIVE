@@ -1,19 +1,22 @@
 import { useEffect, useRef } from "react";
 
 /**
- * Scrollable panel that renders transcript lines and auto-scrolls to the
- * bottom whenever a new line arrives.
+ * Scrollable panel that renders finalized transcript lines plus the
+ * current in-progress (interim) turn, and auto-scrolls to the bottom
+ * whenever either changes.
  */
-export default function TranscriptPanel({ transcripts }) {
+export default function TranscriptPanel({ finals, interim }) {
   const containerRef = useRef(null);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    // Scroll to the very bottom; using scrollTop is reliable across browsers
-    // and avoids the ancestor-scroll quirks of scrollIntoView.
+    // Plain `scrollTop = scrollHeight` is the most reliable cross-browser
+    // way to anchor to the bottom inside a flex/min-h-0 container.
     el.scrollTop = el.scrollHeight;
-  }, [transcripts.length]);
+  }, [finals.length, interim]);
+
+  const isEmpty = finals.length === 0 && !interim;
 
   return (
     <div
@@ -21,19 +24,27 @@ export default function TranscriptPanel({ transcripts }) {
       className="h-full w-full overflow-y-auto rounded-lg p-6 shadow-inner"
       style={{ backgroundColor: "#1e293b" }}
     >
-      {transcripts.length === 0 ? (
-        <p className="italic text-slate-400">Waiting for transcript…</p>
+      {isEmpty ? (
+        <p className="italic text-slate-400">
+          Click <span className="font-medium text-slate-300">Start Microphone</span>{" "}
+          and begin speaking.
+        </p>
       ) : (
         <ul className="space-y-3">
-          {transcripts.map((t) => (
+          {finals.map((line) => (
             <li
-              key={t.id}
+              key={line.id}
               className="leading-relaxed"
               style={{ color: "#ffffff" }}
             >
-              {t.text}
+              {line.text}
             </li>
           ))}
+          {interim ? (
+            <li className="leading-relaxed italic text-slate-400">
+              {interim}
+            </li>
+          ) : null}
         </ul>
       )}
     </div>
