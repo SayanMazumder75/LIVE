@@ -1,14 +1,22 @@
 """
-Hindi-aware translator backed by Google's Gemini API.
+Hindi → English translator backed by Google's Gemini API.
 
-This module is intentionally **self-contained**. It does not touch the
-transcription pipeline — `websocket_server.py` calls
-`Translator.translate(text)` after a final transcript is forwarded, and
-forwards the result to the browser as a separate `translation` message.
+This module is **only** invoked when the client explicitly asks for a
+translation via the `{type:"translate"}` WebSocket control message
+(used by Hindi mode, where the browser does the speech-to-text itself
+because AssemblyAI's streaming model doesn't yet support Hindi).
+
+It is deliberately **not** wired into the AssemblyAI final-transcript
+path: AAI already returns clean English for English audio, so calling
+Gemini there is pure waste of your free-tier quota. Each API does its
+job:
+
+    AssemblyAI key  →  English speech → English text
+    Gemini key      →  Hindi text     → English text
 
 If `GEMINI_API_KEY` is not set, or `httpx` is not installed, the
-translator is a no-op (`enabled == False`) and the rest of the app keeps
-working exactly as before.
+translator is a no-op (`enabled == False`) and the standalone translate
+control message is rejected with a clear error.
 
 Environment variables
 ---------------------
@@ -28,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger("translator")
@@ -37,22 +46,59 @@ GEMINI_ENDPOINT_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
 
-# Kept short and explicit. The model is told to leave English alone so we
-# don't end up with paraphrased English when the user wasn't speaking
-# Hindi — the UI then suppresses identical translations entirely.
+# Hindi-only translator. The defensive "English stays English" rule
+# protects against any stray English text reaching this code path.
 PROMPT_TEMPLATE = (
-    "You are a Hindi-to-English translator for a live captioning app.\n"
+    "You are translating Hindi (Devanagari script or Romanized Hindi) "
+    "to natural, fluent English for a live captioning app.\n"
     "\n"
     "Rules:\n"
+    "- Translate the input into natural, fluent English.\n"
     "- If the input is already entirely in English, return it unchanged.\n"
-    "- If the input contains Hindi (Devanagari script or Romanized Hindi),\n"
-    "  translate it into natural, fluent English.\n"
     "- Preserve names, numbers, and proper nouns.\n"
     "- Output ONLY the translated text. No explanations, no quotes, no labels.\n"
     "\n"
     "Input:\n"
     "{text}"
 )
+
+
+@dataclass(frozen=True)
+class TranslationResult:
+    """
+    Outcome of a translate call. Callers should check fields in order:
+        - if `text`     : success — show the translation
+        - elif `error`  : real API failure — surface to the user
+        - else          : nothing to translate (empty input or disabled)
+    """
+
+    text: Optional[str] = None
+    error: Optional[str] = None
+    # HTTP status code (when the failure was an HTTP response).
+    error_code: Optional[int] = None
+
+
+def _http_status_message(status: int) -> str:
+    """Map common Gemini failure codes to friendly user-facing messages."""
+    if status == 429:
+        return (
+            "Gemini rate limit reached. The free tier allows about 15 requests "
+            "per minute and 1000 per day; wait a moment or switch GEMINI_MODEL."
+        )
+    if status in (401, 403):
+        return (
+            "Gemini API key was rejected. Check GEMINI_API_KEY in backend/.env."
+        )
+    if status == 400:
+        return "Gemini rejected the request as malformed (HTTP 400)."
+    if status == 404:
+        return (
+            "Gemini model not found. Check GEMINI_MODEL — defaults to "
+            "gemini-2.5-flash-lite."
+        )
+    if status >= 500:
+        return f"Gemini is temporarily unavailable (HTTP {status}). Try again."
+    return f"Gemini error: HTTP {status}."
 
 
 class Translator:
@@ -101,16 +147,26 @@ class Translator:
     def enabled(self) -> bool:
         return self._enabled
 
-    async def translate(self, text: str) -> Optional[str]:
+    async def translate(self, text: str) -> TranslationResult:
         """
-        Translate `text` to English. Returns ``None`` if the translator is
-        disabled, the input is empty, or the API call fails — never raises.
+        Translate `text` from Hindi to English.
+
+        Never raises. Returns a `TranslationResult`:
+        - `.text` set on success.
+        - `.error` set when the API call itself failed (rate limit, auth,
+          network, safety block). The caller is expected to surface this
+          to the user.
+        - both `.text` and `.error` left unset when the input was empty
+          or the translator is disabled — callers can treat this as a
+          silent no-op.
         """
-        if not self._enabled or not text:
-            return None
+        if not self._enabled:
+            return TranslationResult()
+        if not text:
+            return TranslationResult()
         text = text.strip()
         if not text:
-            return None
+            return TranslationResult()
 
         url = GEMINI_ENDPOINT_TEMPLATE.format(model=self.model)
         prompt = PROMPT_TEMPLATE.format(text=text)
@@ -125,7 +181,7 @@ class Translator:
         }
 
         try:
-            assert self._httpx is not None  # for type-checkers; gated by _enabled
+            assert self._httpx is not None  # gated by _enabled
             async with self._httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 resp = await client.post(
                     url,
@@ -134,30 +190,38 @@ class Translator:
                     headers={"Content-Type": "application/json"},
                 )
             if resp.status_code != 200:
-                # Don't log the full response by default — it may include
-                # the API key in error envelopes from old proxies.
+                # Don't log the full response body — it can contain the
+                # API key in error envelopes from old proxies.
+                msg = _http_status_message(resp.status_code)
                 logger.warning(
-                    "Gemini returned HTTP %s for translation request",
-                    resp.status_code,
+                    "Gemini returned HTTP %s: %s", resp.status_code, msg
                 )
-                return None
+                return TranslationResult(error=msg, error_code=resp.status_code)
             data = resp.json()
         except Exception as e:  # noqa: BLE001
             logger.warning("translation request failed: %s", e)
-            return None
+            return TranslationResult(error=f"Gemini request failed: {e}")
 
         candidates = data.get("candidates") or []
         if not candidates:
             # Common cause: the prompt was blocked by safety settings.
-            logger.warning(
-                "Gemini returned no candidates (promptFeedback=%s)",
-                data.get("promptFeedback"),
+            feedback = data.get("promptFeedback")
+            logger.warning("Gemini returned no candidates (promptFeedback=%s)", feedback)
+            block_reason = (
+                (feedback or {}).get("blockReason") if isinstance(feedback, dict) else None
             )
-            return None
+            return TranslationResult(
+                error=(
+                    f"Gemini blocked the request ({block_reason})"
+                    if block_reason
+                    else "Gemini returned no result."
+                )
+            )
 
         parts = ((candidates[0].get("content") or {}).get("parts")) or []
         for part in parts:
             translated = (part.get("text") or "").strip()
             if translated:
-                return translated
-        return None
+                return TranslationResult(text=translated)
+        # Empty parts — treat like "no result".
+        return TranslationResult(error="Gemini returned an empty translation.")
