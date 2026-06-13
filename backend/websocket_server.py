@@ -18,7 +18,9 @@ Per-client flow
 Browser → server protocol
 -------------------------
     Binary frames    : 16-bit signed little-endian PCM, mono, 16 kHz
-    Control messages : {"type": "start"} | {"type": "stop"}
+    Control messages : {"type": "start"}
+                       {"type": "stop"}
+                       {"type": "translate", "id": "<id>", "text": "<text>"}
 
 Server → browser protocol
 -------------------------
@@ -35,6 +37,13 @@ Translation (optional, enabled by setting `GEMINI_API_KEY`) runs in a
 fire-and-forget background task per finalized transcript. It never
 blocks transcripts and never modifies them — translations arrive as
 their own message frame keyed to the transcript's `id`.
+
+The "translate" control message is for clients that did the speech-to-
+text themselves (e.g. browser Web Speech API for Hindi, since AAI's
+streaming model doesn't yet support Hindi). The server treats it as a
+standalone "please translate this text" request — it does NOT echo back
+a transcript frame, only the translation. The browser is expected to
+have already rendered the original line with `id` locally.
 """
 
 from __future__ import annotations
@@ -281,11 +290,20 @@ async def _open_aai(api_key: str):
         return await websockets.connect(url, **kwargs)
 
 
-async def _run_session(client_ws, api_key: str) -> None:
+async def _run_session(
+    client_ws,
+    api_key: str,
+    translator: Translator,
+) -> None:
     """
     Open one AssemblyAI session for the connected browser, pump audio
     through it, and stream transcripts back. Returns when the session
     ends (client disconnects, sends `stop`, or AAI terminates).
+
+    `translator` is provided by the caller so locally-recognized
+    transcripts (e.g. Hindi via the browser's Web Speech API) can share
+    the same Gemini configuration without opening a separate AAI
+    session.
     """
     try:
         aai_ws = await _open_aai(api_key)
@@ -299,10 +317,6 @@ async def _run_session(client_ws, api_key: str) -> None:
 
     await _send_json(client_ws, {"type": "status", "status": "ready"})
 
-    # Optional Hindi -> English translator. Constructed per session so a
-    # configuration change (e.g. setting GEMINI_API_KEY) takes effect on
-    # the next browser tab without restarting the whole server.
-    translator = Translator()
     # Tracks in-flight background translation tasks so we can clean them
     # up when the session ends.
     translation_tasks: "set[asyncio.Task]" = set()
@@ -406,6 +420,16 @@ async def _handler(client_ws) -> None:
 
     api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
 
+    # One translator per browser tab. Constructed eagerly so the
+    # "translate" control path (used by Hindi mode) works without
+    # opening an AAI session first.
+    translator = Translator()
+
+    # In-flight background translations triggered by "translate"
+    # control messages outside of any AAI session. Cleaned up on
+    # client disconnect.
+    standalone_translations: "set[asyncio.Task]" = set()
+
     await _send_json(client_ws, {"type": "status", "status": "connected"})
 
     if not api_key:
@@ -441,10 +465,33 @@ async def _handler(client_ws) -> None:
                         },
                     )
                     continue
-                await _run_session(client_ws, api_key)
+                await _run_session(client_ws, api_key, translator)
             elif ctype == "stop":
                 # No active session; nothing to do.
                 continue
+            elif ctype == "translate":
+                # Standalone translation request — used by Hindi mode
+                # where the browser does the recognition itself.
+                text = (ctrl.get("text") or "").strip()
+                msg_id = ctrl.get("id")
+                if not text or not isinstance(msg_id, str) or not msg_id:
+                    continue
+                if not translator.enabled:
+                    await _send_json(
+                        client_ws,
+                        {
+                            "type": "error",
+                            "message": "Translation requested, but GEMINI_API_KEY "
+                            "is not set on the server.",
+                        },
+                    )
+                    continue
+                task = asyncio.create_task(
+                    _translate_and_send(translator, client_ws, msg_id, text),
+                    name=f"standalone-translate-{msg_id}",
+                )
+                standalone_translations.add(task)
+                task.add_done_callback(standalone_translations.discard)
             else:
                 continue
     except ConnectionClosed:
@@ -452,6 +499,20 @@ async def _handler(client_ws) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("client handler crashed")
     finally:
+        # Drain any in-flight standalone translations briefly so the
+        # client gets the last few results, then cancel the rest.
+        if standalone_translations:
+            try:
+                await asyncio.wait(
+                    list(standalone_translations),
+                    timeout=1.0,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            for t in list(standalone_translations):
+                if not t.done():
+                    t.cancel()
         logger.info("client disconnected: %s", peer)
 
 
