@@ -20,7 +20,7 @@ export function useMicrophone(onAudio) {
   const [active, setActive] = useState(false);
   const [error, setError] = useState(null);
 
-  // Keep a stable ref so the worklet's onmessage doesn't capture a stale
+  // Stable ref so the worklet's onmessage doesn't capture a stale
   // callback after re-renders.
   const onAudioRef = useRef(onAudio);
   useEffect(() => {
@@ -31,6 +31,7 @@ export function useMicrophone(onAudio) {
   const streamRef = useRef(null);
   const sourceRef = useRef(null);
   const workletRef = useRef(null);
+  const sentChunksRef = useRef(0);
 
   const stop = useCallback(async () => {
     if (workletRef.current) {
@@ -104,9 +105,17 @@ export function useMicrophone(onAudio) {
       if (!AudioCtx) {
         throw new Error("AudioContext is not available in this browser");
       }
-      const audioCtx = new AudioCtx();
+
+      // Prefer a 16 kHz AudioContext so the browser handles resampling
+      // (with proper anti-alias filtering) and the worklet only has to
+      // do format conversion. Fall back to whatever the browser gives us.
+      let audioCtx;
+      try {
+        audioCtx = new AudioCtx({ sampleRate: TARGET_SAMPLE_RATE });
+      } catch {
+        audioCtx = new AudioCtx();
+      }
       audioCtxRef.current = audioCtx;
-      // Some browsers create the context in "suspended" state.
       if (audioCtx.state === "suspended") {
         try {
           await audioCtx.resume();
@@ -114,6 +123,10 @@ export function useMicrophone(onAudio) {
           /* noop */
         }
       }
+      // eslint-disable-next-line no-console
+      console.info(
+        `[mic] AudioContext sampleRate=${audioCtx.sampleRate} (target=${TARGET_SAMPLE_RATE})`
+      );
 
       await audioCtx.audioWorklet.addModule("/pcm-worklet.js");
 
@@ -127,10 +140,23 @@ export function useMicrophone(onAudio) {
       });
       workletRef.current = worklet;
 
+      sentChunksRef.current = 0;
+
       worklet.port.onmessage = (event) => {
         const cb = onAudioRef.current;
-        if (cb && event.data) {
-          cb(event.data); // ArrayBuffer of Int16 little-endian PCM
+        const data = event.data;
+        if (data && data.type === "init") {
+          // eslint-disable-next-line no-console
+          console.info("[mic] worklet init:", data);
+          return;
+        }
+        if (cb && data instanceof ArrayBuffer) {
+          cb(data); // Int16 little-endian PCM
+          const n = ++sentChunksRef.current;
+          if (n === 1 || n % 100 === 0) {
+            // eslint-disable-next-line no-console
+            console.info(`[mic] sent ${n} audio chunks`);
+          }
         }
       };
 

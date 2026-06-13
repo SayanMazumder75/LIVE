@@ -5,18 +5,22 @@ const RECONNECT_DELAY_MS = 3000;
 /**
  * Manages the WebSocket connection to the transcription bridge.
  *
- * The hook owns the socket and re-connects automatically every 3 seconds
- * if the connection drops. It exposes:
+ * Each `useEffect` run owns its own closure-scoped state (`destroyed`,
+ * `currentWs`, `reconnectTimer`). The WebSocket event handlers compare
+ * the firing socket against `currentWs` before mutating React state, so
+ * a late `onclose` from a cancelled connection cannot affect the current
+ * one. This is what makes the hook safe under React 18 StrictMode dev
+ * mode (where effects mount → cleanup → mount in quick succession) and
+ * under genuine reconnects.
  *
+ * Returns:
  *   status        : "connected" | "disconnected"
  *   sessionStatus : "idle" | "ready" | "stopped" | "error"
- *   finals        : Array<{id, text}>   - finalized transcripts (append-only)
- *   interim       : string              - current in-progress turn
+ *   finals        : Array<{id, text}>     append-only finalized lines
+ *   interim       : string                current in-progress turn
  *   error         : string | null
  *
- *   startSession() : tell server to open an AssemblyAI session
- *   stopSession()  : tell server to close it
- *   sendAudio(buf) : forward a binary PCM chunk
+ *   startSession() / stopSession() / sendAudio(buffer) / clearTranscripts()
  */
 export function useTranscriptSocket(url) {
   const [status, setStatus] = useState("disconnected");
@@ -25,24 +29,24 @@ export function useTranscriptSocket(url) {
   const [interim, setInterim] = useState("");
   const [error, setError] = useState(null);
 
+  // Read by the imperative API (`startSession` / `sendAudio` / ...).
   const wsRef = useRef(null);
-  const reconnectTimerRef = useRef(null);
-  const cancelledRef = useRef(false);
 
   useEffect(() => {
-    cancelledRef.current = false;
+    let destroyed = false;
+    let currentWs = null;
+    let reconnectTimer = null;
 
     const scheduleReconnect = () => {
-      if (cancelledRef.current) return;
-      if (reconnectTimerRef.current) return;
-      reconnectTimerRef.current = setTimeout(() => {
-        reconnectTimerRef.current = null;
-        connect();
+      if (destroyed || reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!destroyed) connect();
       }, RECONNECT_DELAY_MS);
     };
 
     const connect = () => {
-      if (cancelledRef.current) return;
+      if (destroyed) return;
 
       let ws;
       try {
@@ -53,15 +57,16 @@ export function useTranscriptSocket(url) {
         return;
       }
       ws.binaryType = "arraybuffer";
+      currentWs = ws;
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (cancelledRef.current) return;
+        if (ws !== currentWs || destroyed) return;
         setStatus("connected");
       };
 
       ws.onmessage = (event) => {
-        // Server only sends JSON text frames; ignore anything else.
+        if (ws !== currentWs || destroyed) return;
         if (typeof event.data !== "string") return;
 
         let msg;
@@ -98,14 +103,19 @@ export function useTranscriptSocket(url) {
       };
 
       ws.onerror = () => {
-        // `onclose` always follows; reconnect happens there.
+        // Browser fires `onclose` next; the reconnect path lives there.
       };
 
       ws.onclose = () => {
-        if (wsRef.current === ws) {
-          wsRef.current = null;
-        }
-        if (cancelledRef.current) return;
+        // Ignore close events for sockets we've already replaced or
+        // intentionally cancelled — this is the lock that fixes the
+        // StrictMode-dev double-mount race.
+        if (ws !== currentWs) return;
+
+        currentWs = null;
+        if (wsRef.current === ws) wsRef.current = null;
+
+        if (destroyed) return;
         setStatus("disconnected");
         setSessionStatus("idle");
         setInterim("");
@@ -116,18 +126,20 @@ export function useTranscriptSocket(url) {
     connect();
 
     return () => {
-      cancelledRef.current = true;
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
+      destroyed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
-      if (wsRef.current) {
+      const ws = currentWs;
+      currentWs = null;
+      if (wsRef.current === ws) wsRef.current = null;
+      if (ws) {
         try {
-          wsRef.current.close();
+          ws.close();
         } catch {
           /* noop */
         }
-        wsRef.current = null;
       }
     };
   }, [url]);

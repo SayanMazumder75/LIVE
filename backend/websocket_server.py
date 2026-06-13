@@ -11,7 +11,7 @@ Per-client flow
                                                   ▼
                               AssemblyAI Universal-Streaming v3
                                                   │
-                                                  │  Turn / Begin / Termination
+                                                  │  Begin / Turn / Termination / Error
                                                   ▼
     Browser  ◄──(JSON transcripts/status)──   this server
 
@@ -37,23 +37,31 @@ import asyncio
 import json
 import logging
 import os
-from typing import Optional
+import time
+from urllib.parse import urlencode
 
 import websockets
 from websockets.exceptions import ConnectionClosed
-from websockets.legacy.client import WebSocketClientProtocol  # type: ignore
-from websockets.legacy.server import WebSocketServerProtocol  # type: ignore
 
 logger = logging.getLogger("websocket_server")
 
 # AssemblyAI Universal-Streaming v3
+AAI_HOST = "wss://streaming.assemblyai.com/v3/ws"
 AAI_SAMPLE_RATE = 16000
-AAI_URL = (
-    "wss://streaming.assemblyai.com/v3/ws"
-    f"?sample_rate={AAI_SAMPLE_RATE}"
-    "&encoding=pcm_s16le"
-    "&format_turns=true"
-)
+# Match the official SDK's API version pin for stability.
+AAI_API_VERSION = "2025-05-12"
+
+
+def _aai_url() -> str:
+    """Build the v3 streaming URL with sensible defaults for live captions."""
+    params = {
+        "sample_rate": AAI_SAMPLE_RATE,
+        "encoding": "pcm_s16le",
+        # We want live partial transcripts, not just end-of-turn finals.
+        "format_turns": "true",
+        "include_partial_turns": "true",
+    }
+    return f"{AAI_HOST}?{urlencode(params)}"
 
 
 # --------------------------------------------------------------------------
@@ -73,14 +81,17 @@ async def _send_json(ws, payload: dict) -> None:
 
 def _aai_connect_kwargs(api_key: str) -> dict:
     """
-    Build the kwargs for `websockets.connect` so it works on both the
-    websockets v13+ (`additional_headers`) and the older `extra_headers`
-    parameter name. We try the new name first.
+    Headers + connect options for AssemblyAI v3.
+
+    `additional_headers` is the websockets >= 13 spelling. We pin >= 13 in
+    requirements but we still defend against older installs in callers.
     """
-    # websockets >= 13 accepts `additional_headers`. Older versions accept
-    # `extra_headers`. We pin >= 13 in requirements but stay defensive.
     return {
-        "additional_headers": {"Authorization": api_key},
+        "additional_headers": {
+            "Authorization": api_key,
+            "AssemblyAI-Version": AAI_API_VERSION,
+            "User-Agent": "ai-transcriber/0.1 (raw-websocket)",
+        },
         "max_size": None,
         "ping_interval": 20,
         "ping_timeout": 20,
@@ -93,15 +104,11 @@ def _aai_connect_kwargs(api_key: str) -> dict:
 # --------------------------------------------------------------------------
 
 
-async def _forward_aai_to_client(
-    aai_ws: WebSocketClientProtocol,
-    client_ws: WebSocketServerProtocol,
-) -> None:
+async def _forward_aai_to_client(aai_ws, client_ws) -> None:
     """Translate AssemblyAI events into the browser-facing protocol."""
     try:
         async for raw in aai_ws:
             if isinstance(raw, (bytes, bytearray)):
-                # AAI never sends binary on this channel; ignore.
                 continue
             try:
                 msg = json.loads(raw)
@@ -111,21 +118,36 @@ async def _forward_aai_to_client(
             mtype = msg.get("type")
 
             if mtype == "Begin":
-                logger.info("AssemblyAI session begin: id=%s", msg.get("id"))
+                logger.info(
+                    "AAI session begin: id=%s expires_at=%s",
+                    msg.get("id"),
+                    msg.get("expires_at"),
+                )
                 continue
 
             if mtype == "Termination":
-                logger.info("AssemblyAI session terminated")
+                logger.info(
+                    "AAI session terminated: audio=%ss session=%ss",
+                    msg.get("audio_duration_seconds"),
+                    msg.get("session_duration_seconds"),
+                )
                 break
 
             if mtype == "Turn":
                 transcript = (msg.get("transcript") or "").strip()
-                if not transcript:
-                    continue
                 end_of_turn = bool(msg.get("end_of_turn"))
                 formatted = bool(msg.get("turn_is_formatted"))
+                logger.info(
+                    "AAI Turn: end=%s formatted=%s text=%r",
+                    end_of_turn,
+                    formatted,
+                    transcript,
+                )
 
-                # Live partials while the user is speaking.
+                if not transcript:
+                    continue
+
+                # Partial (live) update during a turn.
                 if not end_of_turn:
                     await _send_json(
                         client_ws,
@@ -133,17 +155,37 @@ async def _forward_aai_to_client(
                     )
                     continue
 
-                # End of turn: prefer the formatted version. Skip the raw
-                # final to avoid duplicate appends in the UI.
-                if end_of_turn and formatted:
+                # End of turn. With format_turns=true AAI emits two
+                # end-of-turn frames (unformatted then formatted). Forward
+                # only the formatted one to avoid duplicate appended
+                # lines. As a safety net, if for some reason only the
+                # unformatted version arrives, we still want the user to
+                # see something.
+                if formatted:
                     await _send_json(
                         client_ws,
                         {"type": "transcript", "text": transcript, "final": True},
                     )
-                    continue
+                # Unformatted finals are skipped; the formatted version
+                # follows shortly.
+                continue
 
-                # end_of_turn=True but unformatted: ignore (formatted will
-                # arrive next).
+            if mtype == "Error":
+                err = msg.get("error") or "Unknown AssemblyAI error"
+                code = msg.get("error_code")
+                logger.error("AAI error: code=%s message=%s", code, err)
+                await _send_json(
+                    client_ws,
+                    {"type": "error", "message": f"AssemblyAI: {err}"},
+                )
+                break
+
+            if mtype == "Warning":
+                logger.warning(
+                    "AAI warning: code=%s message=%s",
+                    msg.get("warning_code"),
+                    msg.get("warning"),
+                )
                 continue
 
             # Unknown message types are ignored.
@@ -158,19 +200,25 @@ async def _forward_aai_to_client(
 # --------------------------------------------------------------------------
 
 
-async def _run_session(client_ws: WebSocketServerProtocol, api_key: str) -> None:
+async def _open_aai(api_key: str):
+    """Open the AAI websocket, falling back to older `extra_headers` API."""
+    url = _aai_url()
+    try:
+        return await websockets.connect(url, **_aai_connect_kwargs(api_key))
+    except TypeError:
+        kwargs = _aai_connect_kwargs(api_key)
+        kwargs["extra_headers"] = kwargs.pop("additional_headers")
+        return await websockets.connect(url, **kwargs)
+
+
+async def _run_session(client_ws, api_key: str) -> None:
     """
     Open one AssemblyAI session for the connected browser, pump audio
     through it, and stream transcripts back. Returns when the session
     ends (client disconnects, sends `stop`, or AAI terminates).
     """
     try:
-        aai_ws = await websockets.connect(AAI_URL, **_aai_connect_kwargs(api_key))
-    except TypeError:
-        # Fallback for older websockets versions that use `extra_headers`.
-        kwargs = _aai_connect_kwargs(api_key)
-        kwargs["extra_headers"] = kwargs.pop("additional_headers")
-        aai_ws = await websockets.connect(AAI_URL, **kwargs)
+        aai_ws = await _open_aai(api_key)
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to connect to AssemblyAI")
         await _send_json(
@@ -186,14 +234,34 @@ async def _run_session(client_ws: WebSocketServerProtocol, api_key: str) -> None
         name="aai-forwarder",
     )
 
+    # Periodic audio-flow log so we can tell at a glance whether audio is
+    # actually arriving from the browser. Logged every 5 seconds.
+    bytes_received = 0
+    chunks_received = 0
+    last_log = time.monotonic()
+    LOG_EVERY_SEC = 5.0
+
     try:
         async for message in client_ws:
             if isinstance(message, (bytes, bytearray)):
-                # Forward audio frames straight through.
+                bytes_received += len(message)
+                chunks_received += 1
                 try:
                     await aai_ws.send(message)
                 except ConnectionClosed:
                     break
+
+                now = time.monotonic()
+                if now - last_log >= LOG_EVERY_SEC:
+                    logger.info(
+                        "audio: %d chunks / %d bytes in last %.1fs",
+                        chunks_received,
+                        bytes_received,
+                        now - last_log,
+                    )
+                    bytes_received = 0
+                    chunks_received = 0
+                    last_log = now
                 continue
 
             # Control message
@@ -201,8 +269,15 @@ async def _run_session(client_ws: WebSocketServerProtocol, api_key: str) -> None
                 ctrl = json.loads(message)
             except json.JSONDecodeError:
                 continue
-            if ctrl.get("type") == "stop":
+            ctype = ctrl.get("type")
+            if ctype == "stop":
+                logger.info("client requested stop")
                 break
+            if ctype == "start":
+                # Already in a session — ignore re-starts so we don't open
+                # a second AAI socket for the same browser tab.
+                logger.debug("ignoring 'start' while already streaming")
+                continue
             # Other control messages are ignored mid-session.
     except ConnectionClosed:
         pass
@@ -231,7 +306,7 @@ async def _run_session(client_ws: WebSocketServerProtocol, api_key: str) -> None
 # --------------------------------------------------------------------------
 
 
-async def _handler(client_ws: WebSocketServerProtocol) -> None:
+async def _handler(client_ws) -> None:
     peer = getattr(client_ws, "remote_address", None)
     logger.info("client connected: %s", peer)
 
@@ -272,14 +347,11 @@ async def _handler(client_ws: WebSocketServerProtocol) -> None:
                         },
                     )
                     continue
-                # Run one session; when it returns, loop and wait for
-                # another "start".
                 await _run_session(client_ws, api_key)
             elif ctype == "stop":
                 # No active session; nothing to do.
                 continue
             else:
-                # Unknown control type; ignore.
                 continue
     except ConnectionClosed:
         pass
@@ -310,4 +382,4 @@ async def start_server(host: str = "0.0.0.0", port: int = 8001) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        await asyncio.Future()  # run until cancelled
+        await asyncio.Future()
