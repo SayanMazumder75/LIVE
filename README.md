@@ -1,46 +1,52 @@
 # AI Transcriber
 
-A self-contained, no-LiveKit, browser-based speech-to-text app **with optional Hindi → English translation**.
+A self-contained, no-LiveKit, browser-based **live transcription** app with
+optional **Hindi → English translation** and **system-audio capture** for
+things like YouTube videos and Google Meet calls.
 
-The browser captures microphone audio, streams it as 16 kHz mono PCM to a tiny
-Python WebSocket bridge, which forwards it to **AssemblyAI's Universal-Streaming
-v3** API and pipes the live transcripts back to the React UI. Each finalized
-caption is also (optionally) sent to **Google's Gemini API** for Hindi → English
-translation, which is rendered underneath the original line.
-
-Two **free API keys** are needed for the full experience: AssemblyAI (required)
-and Gemini (optional — leave it blank to disable translation).
+Pick a **language** (English / Hindi) and an **audio source** (Microphone /
+System Audio), click Start, and watch transcripts stream in. Hindi lines get
+an English translation rendered underneath.
 
 ```
-Microphone (browser)
-      │  getUserMedia + AudioWorklet
-      │  → resample to 16 kHz, convert to PCM16 LE
-      ▼
-Browser WebSocket  ──────────►  Python bridge (ws://localhost:8001)
-                                       │
-                                       │  per-client session
-                                       ▼
-                          AssemblyAI Universal-Streaming v3
-                            (wss://streaming.assemblyai.com/v3/ws)
-                                       │
-                                       │  Begin / Turn / Termination
-                                       ▼
-                                Python bridge ──► Gemini (per finalized line)
-                                       │   {"type":"transcript","text":...,"final":bool,"id":...}
-                                       │   {"type":"translation","id":...,"text":...}
-                                       ▼
-                                  React UI
+        Microphone   ─┐                            ┌─►  AssemblyAI v3 (English STT)
+                      ├─► AudioWorklet ─► WS ──────┤
+        System Audio ─┘    PCM16 16 kHz            └─►  (transcripts back to UI)
+
+        (Hindi mode)
+        Microphone ─► browser Web Speech API (hi-IN) ─► local final + WS "translate"
+                                                                  │
+                                                                  ▼
+                                                              Groq Llama 3.3
+                                                              Hindi → English
+                                                                  │
+                                                                  ▼
+                                                            English under each line
 ```
 
-Both API keys never leave the server.
+API keys never leave the server.
+
+## Free API keys you'll need
+
+| Provider     | Used for                                | Free tier (2026) |
+|--------------|-----------------------------------------|------------------|
+| AssemblyAI   | English speech → text (mic & system)    | Streaming credits, no card |
+| Groq         | Hindi text → English translation        | ~30 RPM, ~14,400 req/day |
+
+- **AssemblyAI**: <https://www.assemblyai.com/dashboard/signup>
+- **Groq**: <https://console.groq.com/keys>
+
+Each key has exactly one job. AssemblyAI never sees your Hindi text; Groq
+never sees your English audio. Leave `GROQ_API_KEY` blank to disable
+translation entirely (English mode keeps working).
 
 ## Folder structure
 
 ```
 backend/
-├── main.py                # entry point — loads .env and starts the bridge
+├── main.py                # entry point — loads .env, starts the bridge
 ├── websocket_server.py    # the bridge: browser <-> AssemblyAI v3
-├── translator.py          # optional Hindi -> English via Gemini (isolated)
+├── translator.py          # Hindi -> English via Groq (isolated)
 ├── requirements.txt
 └── .env.example
 
@@ -51,7 +57,7 @@ frontend/
 ├── postcss.config.js
 ├── index.html
 ├── public/
-│   └── pcm-worklet.js     # AudioWorkletProcessor: PCM16 16 kHz mono
+│   └── pcm-worklet.js          # AudioWorkletProcessor: PCM16 16 kHz mono
 └── src/
     ├── main.jsx
     ├── App.jsx
@@ -59,21 +65,11 @@ frontend/
     ├── components/
     │   └── TranscriptPanel.jsx
     └── hooks/
-        ├── useMicrophone.js        # mic capture + resample
+        ├── useMicrophone.js        # mic capture (getUserMedia)
+        ├── useSystemAudio.js       # system / tab audio (getDisplayMedia)
+        ├── useSpeechRecognition.js # browser Web Speech API for Hindi
         └── useTranscriptSocket.js  # WS protocol + auto-reconnect
 ```
-
-## Get the (free) API keys
-
-**AssemblyAI (required)** — sign up at
-<https://www.assemblyai.com/dashboard/signup>. The free tier includes
-credits that work on the Universal-Streaming endpoint.
-
-**Gemini (optional, for Hindi → English translation)** — get a free key at
-<https://aistudio.google.com/app/apikey>. The default model
-(`gemini-2.5-flash-lite`) gives 15 requests/minute and 1000 requests/day on
-the free tier — plenty for an interactive transcriber. Leave `GEMINI_API_KEY`
-blank in `.env` to disable translation entirely.
 
 ## Backend
 
@@ -82,18 +78,18 @@ blank in `.env` to disable translation entirely.
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and paste your real ASSEMBLYAI_API_KEY
+# edit .env and paste your real keys
 ```
 
-`.env` minimally needs:
+`.env`:
 
-```
+```ini
 ASSEMBLYAI_API_KEY=your_assemblyai_key
-GEMINI_API_KEY=                      # optional: enables Hindi -> English translation
-GEMINI_MODEL=                        # optional: defaults to gemini-2.5-flash-lite
+GROQ_API_KEY=                        # optional: enables Hindi -> English translation
+GROQ_MODEL=                          # optional: defaults to llama-3.3-70b-versatile
 WS_HOST=0.0.0.0                      # optional
 WS_PORT=8001                         # optional
 ```
@@ -109,23 +105,30 @@ You should see:
 
 ```
 [INFO] websocket_server: transcriber WS server listening on ws://0.0.0.0:8001
+[INFO] translator: translator enabled (provider=groq, model=llama-3.3-70b-versatile)
 ```
 
 ### Wire protocol
 
 Browser → server:
 - Binary frames: 16-bit signed little-endian PCM, mono, 16 kHz.
-- Control: `{"type":"start"}`, `{"type":"stop"}`.
+- `{"type":"start"}` — open an AssemblyAI session (English mode only).
+- `{"type":"stop"}` — close the AAI session.
+- `{"type":"translate","id":"<id>","text":"<hindi text>"}` — Hindi mode only;
+  the browser already did the speech-to-text and just wants the Hindi → English
+  step.
 
 Server → browser:
 - `{"type":"status","status":"connected" | "ready" | "stopped"}`
-- `{"type":"transcript","text":"...","final":true,"id":"..."}` — finalized line; append. The `id` is a short hex string the server generates so a later translation can attach to it.
-- `{"type":"transcript","text":"...","final":false}` — interim turn; replace.
-- `{"type":"translation","id":"<final-id>","text":"...","source_text":"..."}` — Gemini translation of a previously-sent finalized line. UI attaches it to the matching final by `id`. Only sent when `GEMINI_API_KEY` is configured **and** the translation actually differs from the original (English-only finals don't generate translation frames).
-- `{"type":"error","message":"..."}`
+- `{"type":"transcript","text":"...","final":true,"id":"..."}` — finalized line.
+- `{"type":"transcript","text":"...","final":false}` — interim turn.
+- `{"type":"translation","id":"<final-id>","text":"...","source_text":"..."}` —
+  Groq's English translation, keyed to the line's `id`.
+- `{"type":"error","message":"..."}` — surfaced to the UI as a banner. The
+  most common one is Groq returning HTTP 429 (rate limit).
 
-Each `start` opens one AssemblyAI session for that browser; `stop` (or a
-WebSocket close) tears it down so you don't keep burning credits.
+The `id` lets a later translation frame attach to the right line in the UI
+even though they arrive over time.
 
 ## Frontend
 
@@ -137,9 +140,8 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:5173>, click **Start Microphone**, allow mic access,
-and start talking. Finalized lines append; the current in-progress turn is
-shown italic-grayed at the bottom and is replaced as you speak.
+Open <http://localhost:5173>. You'll see two dropdowns in the header:
+**Language** and **Source**.
 
 To point the UI at a non-default backend host:
 
@@ -155,43 +157,77 @@ npm run build
 npm run preview
 ```
 
+### Modes
+
+There are three useful combinations:
+
+| Language | Source        | What happens                                           |
+|----------|---------------|--------------------------------------------------------|
+| English  | Microphone    | Mic → AssemblyAI → live English transcripts            |
+| English  | System Audio  | Tab/screen audio → AssemblyAI → live English transcripts |
+| Hindi    | Microphone    | Mic → browser Web Speech API → Hindi line + Groq translation |
+
+Hindi + System Audio is intentionally disabled: the browser's Hindi speech
+recognizer only listens to the microphone, there's no API to feed it an
+arbitrary stream. The **Source** dropdown shows the option grayed out with
+*(English only)* in Hindi mode.
+
+### Using System Audio (YouTube, Google Meet, …)
+
+1. Pick **English** as the language and **System Audio** as the source.
+2. Click **Start System Audio**.
+3. In the browser's share picker:
+   - Choose **a Tab** (best for YouTube, Meet) or **Entire Screen**.
+   - **Tick "Share tab audio"** (or **"Share system audio"** for full screen).
+   - **Window** mode has no audio — picking a window will fail with a
+     friendly error.
+4. Transcripts start streaming. To stop, either click **Stop System Audio**
+   in the app, or click the browser's persistent "Stop sharing" indicator
+   at the top of the page — both flip the UI back to idle.
+
+The video track is captured to satisfy the `getDisplayMedia` spec but is
+discarded immediately, so no video is recorded or sent anywhere.
+
 ### Browser requirements
 
-- `getUserMedia` requires **HTTPS or `localhost`**. `http://localhost:5173`
-  works for local development; deploying behind plain HTTP will not.
-- Modern Chromium / Firefox / Safari all support `AudioWorklet`.
+- `getUserMedia` (microphone) and `getDisplayMedia` (system audio) both
+  require **HTTPS or `localhost`**.
+- **System Audio** works best in **Chrome / Edge** on a desktop OS. Firefox
+  has limited support; Safari mostly doesn't support it.
+- **Hindi mode** requires the Web Speech API. **Chrome / Edge** support it
+  with `hi-IN` natively; Firefox doesn't expose continuous recognition.
 
-## How it all fits together
+## How a session flows
 
-1. You click **Start Microphone**.
-2. The browser requests mic permission, opens an `AudioContext`, and loads
-   `/pcm-worklet.js` as an AudioWorkletNode. The worklet downsamples each
-   frame from the device rate (typically 48 kHz float32) to 16 kHz int16
-   little-endian and posts ~50 ms chunks to the main thread.
-3. The main thread sends each chunk as a binary frame over the existing
-   WebSocket to the backend.
-4. The backend opens a per-client session to AssemblyAI's Universal-Streaming
-   v3 endpoint with your API key in the `Authorization` header, and forwards
-   audio frames straight through.
-5. AssemblyAI emits `Turn` events. The backend translates them:
-   - in-progress turns → `{"type":"transcript","final":false}`
-   - end-of-turn formatted → `{"type":"transcript","final":true,"id":...}`
-6. **(Optional)** If `GEMINI_API_KEY` is set, every finalized line also
-   triggers a fire-and-forget background task that calls Gemini, asks it to
-   translate Hindi to English (and leave English alone), and — if the
-   result differs from the original — sends back a separate
-   `{"type":"translation","id":...}` frame. The UI attaches it to the
-   matching line and renders it in muted green underneath.
-7. The React UI appends finalized lines to a list and shows the current
-   in-progress turn underneath. The transcript panel auto-scrolls to the
-   bottom on every change.
-8. **Stop Microphone** stops the audio tracks, closes the worklet, and
-   sends `{"type":"stop"}`, which makes the backend gracefully terminate the
-   AssemblyAI session and drain any pending translation tasks.
+1. The page loads and opens a WebSocket to the backend → status flips to
+   **Connected**.
+2. You pick Language and Source, then click **Start**.
+
+   - **English + Microphone**: browser asks for mic permission → AudioContext
+     at 16 kHz → AudioWorklet emits PCM16 chunks → WS sends `{type:"start"}`,
+     server opens an AssemblyAI session, server forwards audio chunks → AAI
+     replies with `Begin` → `Turn` (interim & final) → `Termination`.
+   - **English + System Audio**: browser shows the share picker → if the
+     user cancels, **no AAI session is opened** (no quota wasted) → if they
+     pick a Tab/Screen with audio, the rest is identical to the mic flow.
+   - **Hindi + Microphone**: browser asks for mic permission → Web Speech
+     API streams interim and final results in `hi-IN` → each Hindi final is
+     appended to the UI immediately and shipped to the server with
+     `{type:"translate"}` → server calls Groq → server returns
+     `{type:"translation", id, text}` → UI attaches the English under the
+     matching line.
+
+3. The **Live Transcript** panel auto-scrolls. Finals stay on screen; the
+   current in-progress turn is shown italic-greyed at the bottom and is
+   replaced as you speak.
+
+4. **Stop** releases the audio source, sends `{"type":"stop"}` (or the
+   stream end fires automatically when you hit the browser's Stop sharing
+   indicator), and the AAI session is gracefully terminated server-side.
 
 ## Style
 
-Dark theme, exactly as specified:
+Dark theme, exactly as originally specified:
 
 | Element            | Color       |
 | ------------------ | ----------- |
@@ -201,13 +237,33 @@ Dark theme, exactly as specified:
 
 ## Notes
 
-- No LiveKit anywhere — backend or frontend.
-- Translation is **fully isolated** in `backend/translator.py`. Removing
-  `GEMINI_API_KEY` (or removing the file entirely) leaves the rest of the
-  app untouched and working.
+- **No LiveKit anywhere** — backend or frontend.
+- **Translation is isolated** in `backend/translator.py`. Removing
+  `GROQ_API_KEY` from `.env` (or deleting the file entirely) leaves the
+  rest of the app untouched and working — English transcription still runs.
+- **AssemblyAI is never called for Hindi text**, and **Groq is never called
+  for English audio**. Each provider does exactly one thing and no quota
+  is wasted on round-trips that produce no UI change.
+- Audio is **never written to disk**; it streams straight through.
 - The frontend reconnects to the backend WebSocket every 3 seconds if the
-  connection drops, and shows **Disconnected** until it's back.
-- The backend prints a warning at startup if `ASSEMBLYAI_API_KEY` is not set,
-  and propagates a clear error to the UI if a client tries to start without
-  one.
-- Audio is never written to disk; it streams straight through.
+  connection drops, and shows **Disconnected** until it's back. Hindi mode
+  is independent of the WS — recognition keeps working locally; only the
+  translation step pauses until the WS comes back.
+- The backend prints a warning at startup if `ASSEMBLYAI_API_KEY` is not
+  set, and propagates a clear error frame to the UI if a client tries to
+  start without one. Same goes for `GROQ_API_KEY` when a Hindi translation
+  is requested.
+
+## If translations stop appearing under Hindi lines
+
+Most often, you've hit Groq's free-tier rate limit. The UI shows a banner
+like *"Translation: Groq rate limit reached…"*. Options:
+
+- Wait a minute (the per-minute window resets quickly).
+- Set `GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct` or another
+  free-tier-eligible model in `.env`.
+- Generate a fresh Groq key.
+
+Hindi recognition itself doesn't go through Groq, so transcripts keep
+flowing in Devanagari even when translations are paused — only the English
+under each line is missing.
