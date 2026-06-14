@@ -16,6 +16,35 @@ const HINDI_CHUNK_MS = 4000;
 // Drop chunks shorter than ~0.3 s of audio (16 kHz mono int16 = 32 B/ms)
 // — Whisper struggles on tiny clips and they often produce hallucinations.
 const HINDI_MIN_BYTES = 16000 * 2 * 0.3;
+// Silence threshold for the chunk's normalized RMS (0..1, where 1 is
+// full scale). When the captured audio is below this, we don't ship the
+// chunk to Whisper at all — it would otherwise hallucinate things like
+// "झाल" or "Thanks for watching" on near-silent input. Tuned so quiet
+// ambient noise from a tab still passes, but the YouTube "preroll
+// silence" / muted-tab case is dropped. Override at build time with
+// VITE_HINDI_SILENCE_RMS if you need a different threshold for your
+// environment.
+const HINDI_SILENCE_RMS = (() => {
+  const raw = import.meta.env.VITE_HINDI_SILENCE_RMS;
+  const n = parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0.01;
+})();
+
+/**
+ * Normalized RMS of a PCM16-LE ArrayBuffer in [0, 1]. Used as a cheap
+ * voice-activity check on Hindi+System chunks before we spend a Whisper
+ * request on them. Returns 0 for an empty buffer.
+ */
+function computePcm16Rms(arrayBuffer) {
+  const view = new Int16Array(arrayBuffer);
+  if (view.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < view.length; i++) {
+    const v = view[i] / 32768; // normalize to [-1, 1]
+    sumSq += v * v;
+  }
+  return Math.sqrt(sumSq / view.length);
+}
 
 // Two language modes:
 //
@@ -101,6 +130,23 @@ export default function App() {
       combined.set(new Uint8Array(c), offset);
       offset += c.byteLength;
     }
+
+    // Voice-activity gate. Whisper is famous for hallucinating things
+    // like "झाल" or "Thanks for watching" when given near-silent
+    // audio — the model has heard a lot of YouTube credit tails during
+    // training and falls back to them on quiet input. The cleanest fix
+    // is to never give it silent audio: if this chunk's RMS is below
+    // the threshold, we drop it on the floor instead of spending a
+    // Groq request on it.
+    const rms = computePcm16Rms(combined.buffer);
+    if (rms < HINDI_SILENCE_RMS) {
+      // eslint-disable-next-line no-console
+      console.info(
+        `[hindi] skipping silent chunk (rms=${rms.toFixed(4)} < ${HINDI_SILENCE_RMS})`
+      );
+      return;
+    }
+
     const id = `hi-sys-${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 7)}`;
