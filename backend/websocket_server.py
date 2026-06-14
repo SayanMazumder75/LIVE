@@ -301,6 +301,55 @@ async def _translate_and_send(
 # Hindi system-audio chunk processing
 # --------------------------------------------------------------------------
 
+# Common Whisper hallucinations on near-silent / non-speech audio.
+# Whisper picks these up from training noise (YouTube credit tails,
+# common Hindi closing words) and confidently emits them when there's
+# nothing actually being spoken. We hard-filter these on the server
+# even when the frontend's RMS gate lets a chunk through, so a single
+# slip-through doesn't pollute the captions.
+#
+# Listed normalized (lower-cased, with surrounding whitespace and
+# trailing Devanagari/ASCII sentence punctuation stripped). The list
+# stays short on purpose — the dedup-against-last-emitted check is the
+# stronger signal, and we don't want to silence legitimate one-word
+# captions.
+_HINDI_HALLUCINATIONS = frozenset(
+    {
+        # The exact case the user reported in the screenshot.
+        "झाल",
+        "झालर",
+        # YouTube credit-tail leakage. Whisper emits these in *any*
+        # configured language when given silence.
+        "thanks for watching",
+        "thanks for watching!",
+        "thank you for watching",
+        "thank you for watching!",
+        "thank you",
+        "thank you.",
+        "thanks",
+        "thanks.",
+        "subtitles by the amara.org community",
+        # Music notation it sometimes emits during instrumental music.
+        "♪",
+        "♪♪",
+        "♪♪♪",
+        "[music]",
+    }
+)
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """
+    Normalize a transcript for de-duplication / hallucination matching.
+    Strips outer whitespace, common ASCII / Devanagari sentence
+    terminators, then lower-cases. Two transcripts that differ only in
+    trailing punctuation hit the same bucket.
+    """
+    s = (text or "").strip()
+    while s and s[-1] in "।.,!?…":
+        s = s[:-1].rstrip()
+    return s.lower()
+
 
 async def _transcribe_and_send(
     stt: WhisperSTT,
@@ -308,15 +357,23 @@ async def _transcribe_and_send(
     client_ws,
     chunk_id: str,
     pcm_bytes: bytes,
-) -> None:
+    last_emitted_norm: "str | None" = None,
+) -> "str | None":
     """
     Run a Hindi audio chunk through Whisper, emit the transcript, then
     run the resulting Hindi text through the existing Translator and
     emit the translation. Never raises.
 
+    Returns the *normalized* form of the emitted transcript on success,
+    or ``None`` when nothing was emitted (Whisper failed, Whisper
+    returned empty, the result was a known hallucination, or the
+    result was an immediate repeat of the last emission). The loop
+    uses the return value to thread `last_emitted_norm` through
+    successive calls.
+
     Frames are emitted in this order:
 
-        {type:"transcript", final:true, id, text:<hindi>}    (always)
+        {type:"transcript", final:true, id, text:<hindi>}    (on emit)
         {type:"translation", id, text:<english>, ...}        (if enabled
                                                               and Groq
                                                               succeeded)
@@ -329,20 +386,40 @@ async def _transcribe_and_send(
         result: TranscriptionResult = await stt.transcribe(pcm_bytes, language="hi")
     except Exception:  # noqa: BLE001
         logger.exception("whisper raised; skipping chunk id=%s", chunk_id)
-        return
+        return None
 
     if result.error:
         await _send_json(
             client_ws,
             {"type": "error", "message": f"Hindi STT: {result.error}"},
         )
-        return
+        return None
 
     if not result.text:
         # Empty / silent chunk — silent no-op.
-        return
+        return None
 
     hindi_text = result.text
+    norm = _normalize_for_dedup(hindi_text)
+
+    # Known-hallucination filter. Trips on the exact "झाल" loop the
+    # user reported, plus the usual "Thanks for watching" leakage.
+    if norm in _HINDI_HALLUCINATIONS:
+        logger.info(
+            "suppressed known hallucination id=%s text=%r", chunk_id, hindi_text
+        )
+        return None
+
+    # Repeat filter. Whisper's silence loops produce the SAME
+    # transcript over and over. The first occurrence might still be
+    # legitimate (a user actually said the word once), so we let it
+    # through; the second and beyond are suppressed.
+    if last_emitted_norm is not None and norm == last_emitted_norm:
+        logger.info(
+            "suppressed repeated transcript id=%s text=%r", chunk_id, hindi_text
+        )
+        return None
+
     logger.info("whisper: id=%s text=%r", chunk_id, hindi_text)
     await _send_json(
         client_ws,
@@ -360,6 +437,8 @@ async def _transcribe_and_send(
     if translator.enabled:
         await _translate_and_send(translator, client_ws, chunk_id, hindi_text)
 
+    return norm
+
 
 async def _hindi_chunk_loop(
     stt: WhisperSTT,
@@ -372,18 +451,32 @@ async def _hindi_chunk_loop(
     arrival order. Sequential by design so the captions appear in the
     same order the user heard them, even when Whisper / Groq response
     times jitter a bit.
+
+    Carries `last_emitted_norm` across calls so the hallucination
+    filter inside `_transcribe_and_send` can suppress immediate
+    repeats — Whisper's hallmark on silence is the same word stuck on
+    a loop.
     """
+    last_emitted_norm: "str | None" = None
     while True:
         item = await queue.get()
         if item is None:
             return
         chunk_id, pcm_bytes = item
         try:
-            await _transcribe_and_send(
-                stt, translator, client_ws, chunk_id, pcm_bytes
+            emitted = await _transcribe_and_send(
+                stt,
+                translator,
+                client_ws,
+                chunk_id,
+                pcm_bytes,
+                last_emitted_norm=last_emitted_norm,
             )
         except Exception:  # noqa: BLE001
             logger.exception("hindi chunk processing failed id=%s", chunk_id)
+            continue
+        if emitted is not None:
+            last_emitted_norm = emitted
 
 
 # --------------------------------------------------------------------------
