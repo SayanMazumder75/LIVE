@@ -10,7 +10,11 @@ const TARGET_SAMPLE_RATE = 16000;
  * Returns:
  *   active : boolean  - whether the mic is currently capturing
  *   error  : string|null
- *   start  : () => Promise<void>
+ *   start  : (deviceId?: string) => Promise<void>
+ *            Optionally pin the capture to a specific input device by
+ *            passing its `MediaDeviceInfo.deviceId`. Callers that
+ *            don't pass anything keep the original behaviour and let
+ *            the browser pick the system default.
  *   stop   : () => Promise<void>
  *
  * `getUserMedia` requires a secure context (HTTPS or localhost) and a
@@ -76,7 +80,7 @@ export function useMicrophone(onAudio) {
     setActive(false);
   }, []);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (deviceId) => {
     setError(null);
     if (
       typeof navigator === "undefined" ||
@@ -90,13 +94,19 @@ export function useMicrophone(onAudio) {
     }
 
     try {
+      const audioConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+      // Optional, additive: pin to a specific input device when one is
+      // selected. Without this the browser keeps picking the default.
+      if (deviceId) {
+        audioConstraints.deviceId = { exact: deviceId };
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: audioConstraints,
         video: false,
       });
       streamRef.current = stream;

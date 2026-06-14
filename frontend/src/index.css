@@ -1,3 +1,11 @@
+/*
+ * Inter is the de-facto product/UI font for modern dashboards. We pull
+ * weights 400/500/600/700 — enough for body, medium, semibold headings,
+ * and bold call-outs without bloating the bundle. `display=swap` lets
+ * text show with the system fallback while Inter loads.
+ */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -8,6 +16,87 @@ body,
   height: 100%;
   margin: 0;
   padding: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+}
+
+/*
+ * Theme tokens. The design uses a small slate-based palette plus an
+ * indigo accent. Both light and dark mode get the same set of token
+ * names so every component can reach for `bg-[color:var(--surface)]`
+ * without branching on the theme.
+ */
+:root {
+  --bg: #f8fafc;            /* page background */
+  --bg-elevated: #ffffff;   /* card surface */
+  --surface: #ffffff;       /* same as elevated, kept for clarity */
+  --surface-2: #f1f5f9;     /* sub-card / hover */
+  --text: #0f172a;          /* primary text */
+  --text-muted: #64748b;    /* secondary text */
+  --text-subtle: #94a3b8;   /* tertiary / placeholder */
+  --border: #e2e8f0;        /* hairline borders */
+  --border-strong: #cbd5e1; /* visible borders */
+  --accent: #4f46e5;        /* indigo-600 */
+  --accent-hover: #4338ca;  /* indigo-700 */
+  --accent-soft: #eef2ff;   /* indigo-50 */
+  --success: #10b981;       /* emerald-500 */
+  --danger: #ef4444;        /* red-500 */
+  --warning: #f59e0b;       /* amber-500 */
+}
+
+html.dark {
+  --bg: #0b1120;            /* deeper than before for more contrast */
+  --bg-elevated: #111827;
+  --surface: #0f172a;
+  --surface-2: #1e293b;
+  --text: #f1f5f9;
+  --text-muted: #94a3b8;
+  --text-subtle: #64748b;
+  --border: #1f2937;
+  --border-strong: #334155;
+  --accent: #818cf8;        /* lighter indigo on dark */
+  --accent-hover: #a5b4fc;
+  --accent-soft: rgba(99, 102, 241, 0.15);
+  --success: #34d399;
+  --danger: #f87171;
+  --warning: #fbbf24;
+}
+
+html,
+body,
+#root {
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--bg);
+  color: var(--text);
+  /* Smooth out the theme switch so the page doesn't strobe. */
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+/*
+ * Tabular numerals make the connection-status / chunk-counter values
+ * visually stable when they change.
+ */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Custom scrollbar so the transcript panels feel intentional rather
+ * than browser-default. Falls back to platform defaults outside
+ * Chromium / WebKit.
+ */
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--border-strong);
+  border-radius: 999px;
+}
+.thin-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-subtle);
 }
