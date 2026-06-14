@@ -21,6 +21,9 @@ Browser → server protocol
     Control messages : {"type": "start"}
                        {"type": "stop"}
                        {"type": "translate", "id": "<id>", "text": "<text>"}
+                       {"type": "hindi_chunk", "id": "<id>"}
+                         followed immediately by ONE binary frame of
+                         16 kHz mono int16 LE PCM (~0.3 – 30 seconds).
 
 Server → browser protocol
 -------------------------
@@ -37,19 +40,30 @@ Translation policy
 ------------------
 This server uses TWO independent APIs with TWO non-overlapping jobs:
 
-    AssemblyAI key  →  English speech  →  English text
-    Groq key        →  Hindi   text    →  English text
+    AssemblyAI key  →  English speech         →  English text
+    Groq key        →  Hindi text / Hindi audio →  English text
 
 We deliberately do NOT call Groq on AssemblyAI's English finals — AAI
 already returns clean English, and an LLM round-trip would just burn
-free-tier quota. The only path that talks to Groq is the explicit
-`{type:"translate", id, text}` control message, used by Hindi mode
-where the browser does the speech-to-text itself with the Web Speech
-API.
+free-tier quota. The only paths that talk to Groq are:
+
+  * `{type:"translate", id, text}`     — Hindi text  → English text
+                                         (used by Hindi + Microphone:
+                                         the browser's Web Speech API
+                                         did the STT.)
+  * `{type:"hindi_chunk", id}` + binary — Hindi audio → English text
+                                         (used by Hindi + System Audio:
+                                         the browser can't feed system
+                                         audio into the Web Speech API,
+                                         so we send PCM chunks to Groq
+                                         Whisper, then feed the
+                                         resulting Hindi text into the
+                                         same translator.)
 
 When Groq returns a real failure (most commonly HTTP 429 rate limit),
 the server forwards a `{type:"error", message:...}` frame so the user
-sees *why* a translation didn't appear instead of silently missing.
+sees *why* a transcript / translation didn't appear instead of silently
+missing.
 """
 
 from __future__ import annotations
@@ -66,6 +80,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from translator import Translator, TranslationResult
+from stt import WhisperSTT, TranscriptionResult
 
 logger = logging.getLogger("websocket_server")
 
@@ -283,6 +298,95 @@ async def _translate_and_send(
 
 
 # --------------------------------------------------------------------------
+# Hindi system-audio chunk processing
+# --------------------------------------------------------------------------
+
+
+async def _transcribe_and_send(
+    stt: WhisperSTT,
+    translator: Translator,
+    client_ws,
+    chunk_id: str,
+    pcm_bytes: bytes,
+) -> None:
+    """
+    Run a Hindi audio chunk through Whisper, emit the transcript, then
+    run the resulting Hindi text through the existing Translator and
+    emit the translation. Never raises.
+
+    Frames are emitted in this order:
+
+        {type:"transcript", final:true, id, text:<hindi>}    (always)
+        {type:"translation", id, text:<english>, ...}        (if enabled
+                                                              and Groq
+                                                              succeeded)
+
+    On any real Whisper / translator failure (rate limit, auth, …) we
+    emit a `{type:"error", message:...}` frame so the user sees why a
+    caption / translation didn't appear.
+    """
+    try:
+        result: TranscriptionResult = await stt.transcribe(pcm_bytes, language="hi")
+    except Exception:  # noqa: BLE001
+        logger.exception("whisper raised; skipping chunk id=%s", chunk_id)
+        return
+
+    if result.error:
+        await _send_json(
+            client_ws,
+            {"type": "error", "message": f"Hindi STT: {result.error}"},
+        )
+        return
+
+    if not result.text:
+        # Empty / silent chunk — silent no-op.
+        return
+
+    hindi_text = result.text
+    logger.info("whisper: id=%s text=%r", chunk_id, hindi_text)
+    await _send_json(
+        client_ws,
+        {
+            "type": "transcript",
+            "text": hindi_text,
+            "final": True,
+            "id": chunk_id,
+        },
+    )
+
+    # Re-use the existing translation path so Hindi + System Audio
+    # produces the same UI shape (Hindi line + English under it) as
+    # Hindi + Microphone.
+    if translator.enabled:
+        await _translate_and_send(translator, client_ws, chunk_id, hindi_text)
+
+
+async def _hindi_chunk_loop(
+    stt: WhisperSTT,
+    translator: Translator,
+    client_ws,
+    queue: "asyncio.Queue",
+) -> None:
+    """
+    Single per-client consumer that processes Hindi audio chunks in
+    arrival order. Sequential by design so the captions appear in the
+    same order the user heard them, even when Whisper / Groq response
+    times jitter a bit.
+    """
+    while True:
+        item = await queue.get()
+        if item is None:
+            return
+        chunk_id, pcm_bytes = item
+        try:
+            await _transcribe_and_send(
+                stt, translator, client_ws, chunk_id, pcm_bytes
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("hindi chunk processing failed id=%s", chunk_id)
+
+
+# --------------------------------------------------------------------------
 # one transcription session
 # --------------------------------------------------------------------------
 
@@ -407,14 +511,32 @@ async def _handler(client_ws) -> None:
 
     api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
 
-    # One translator per browser tab. Constructed eagerly so the
-    # "translate" control path (used by Hindi mode) works without
-    # opening an AAI session first.
+    # One translator + one Whisper STT per browser tab. Constructed
+    # eagerly so the "translate" and "hindi_chunk" control paths work
+    # without opening an AAI session first.
     translator = Translator()
+    stt = WhisperSTT()
 
     # In-flight background translations triggered by "translate"
     # control messages. Cleaned up on client disconnect.
     translation_tasks: "set[asyncio.Task]" = set()
+
+    # Hindi system-audio chunks are processed sequentially by a single
+    # consumer task so the captions arrive in the order they were
+    # spoken. The handler enqueues (id, pcm_bytes) tuples; the
+    # consumer drains them one at a time and posts both the transcript
+    # and (optionally) translation back to the client.
+    hindi_queue: "asyncio.Queue" = asyncio.Queue()
+    hindi_consumer = asyncio.create_task(
+        _hindi_chunk_loop(stt, translator, client_ws, hindi_queue),
+        name="hindi-chunk-loop",
+    )
+
+    # When a "hindi_chunk" JSON arrives, we stash its metadata here
+    # and wait for the very next binary frame on the same WebSocket
+    # to carry the audio payload. WebSocket guarantees frame order on
+    # a single connection, so this two-step protocol is robust.
+    pending_chunk_meta: "dict | None" = None
 
     await _send_json(client_ws, {"type": "status", "status": "connected"})
 
@@ -431,7 +553,31 @@ async def _handler(client_ws) -> None:
     try:
         async for message in client_ws:
             if isinstance(message, (bytes, bytearray)):
-                # No active session; drop audio silently.
+                if pending_chunk_meta is not None:
+                    # This binary frame is the audio payload for the
+                    # last hindi_chunk JSON we just received.
+                    meta = pending_chunk_meta
+                    pending_chunk_meta = None
+                    chunk_id = meta.get("id")
+                    if not isinstance(chunk_id, str) or not chunk_id:
+                        continue
+                    if not stt.enabled:
+                        await _send_json(
+                            client_ws,
+                            {
+                                "type": "error",
+                                "message": "Hindi system-audio mode requested, "
+                                "but GROQ_API_KEY is not set on the server.",
+                            },
+                        )
+                        continue
+                    # Hand off to the sequential consumer. The consumer
+                    # owns the I/O latency budget — the message loop
+                    # stays free for the next chunk.
+                    await hindi_queue.put((chunk_id, bytes(message)))
+                    continue
+                # Otherwise we're outside an AAI session and there's no
+                # pending hindi chunk — drop the bytes silently.
                 continue
 
             try:
@@ -451,14 +597,19 @@ async def _handler(client_ws) -> None:
                         },
                     )
                     continue
+                # Defensive: clear any stale chunk meta when a new
+                # session starts. The mic / system-audio English flow
+                # never sends hindi_chunk, but this guards against
+                # weird client bugs.
+                pending_chunk_meta = None
                 await _run_session(client_ws, api_key)
             elif ctype == "stop":
                 # No active session; nothing to do.
                 continue
             elif ctype == "translate":
-                # Hindi-mode standalone translation request — the browser
-                # has already done the speech-to-text and is asking us
-                # only for the Hindi -> English step.
+                # Hindi + Microphone path: the browser already did the
+                # speech-to-text via the Web Speech API and is only
+                # asking us to translate.
                 text = (ctrl.get("text") or "").strip()
                 msg_id = ctrl.get("id")
                 if not text or not isinstance(msg_id, str) or not msg_id:
@@ -479,6 +630,15 @@ async def _handler(client_ws) -> None:
                 )
                 translation_tasks.add(task)
                 task.add_done_callback(translation_tasks.discard)
+            elif ctype == "hindi_chunk":
+                # Hindi + System Audio path: the next message will be
+                # a binary PCM blob to feed through Whisper. We just
+                # remember the metadata; the binary handler above does
+                # the work.
+                msg_id = ctrl.get("id")
+                if not isinstance(msg_id, str) or not msg_id:
+                    continue
+                pending_chunk_meta = ctrl
             else:
                 continue
     except ConnectionClosed:
@@ -500,6 +660,19 @@ async def _handler(client_ws) -> None:
             for t in list(translation_tasks):
                 if not t.done():
                     t.cancel()
+
+        # Stop the Hindi chunk consumer with a sentinel so any chunks
+        # still in the queue are skipped (the connection is going
+        # away — the client wouldn't see them anyway).
+        try:
+            await asyncio.wait_for(hindi_queue.put(None), timeout=0.5)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await asyncio.wait_for(hindi_consumer, timeout=0.5)
+        except Exception:  # noqa: BLE001
+            hindi_consumer.cancel()
+
         logger.info("client disconnected: %s", peer)
 
 
