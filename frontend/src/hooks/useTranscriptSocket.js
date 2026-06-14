@@ -254,6 +254,19 @@ export function useTranscriptSocket(url) {
     ws.send(JSON.stringify({ type: "translate", id, text }));
   }, []);
 
+  // Hindi + System Audio: ship a chunk of PCM bytes for Whisper to
+  // transcribe. Two-step send to keep the wire format simple — the
+  // server reads the JSON meta, then expects the very next binary
+  // frame to be the audio payload. WebSocket guarantees frame order
+  // on a single connection, so this is reliable.
+  const requestHindiChunk = useCallback((id, audioBuffer) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!id || !audioBuffer || audioBuffer.byteLength === 0) return;
+    ws.send(JSON.stringify({ type: "hindi_chunk", id }));
+    ws.send(audioBuffer);
+  }, []);
+
   return {
     status,
     sessionStatus,
@@ -268,5 +281,6 @@ export function useTranscriptSocket(url) {
     addLocalFinal,
     setLocalInterim,
     requestTranslation,
+    requestHindiChunk,
   };
 }
