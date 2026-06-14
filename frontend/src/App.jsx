@@ -1,89 +1,67 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import TranscriptPanel from "./components/TranscriptPanel.jsx";
+import FloatingMicWidget from "./components/FloatingMicWidget.jsx";
 import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
-import { useMicrophone } from "./hooks/useMicrophone.js";
-import { useSystemAudio } from "./hooks/useSystemAudio.js";
-import { useSpeechRecognition } from "./hooks/useSpeechRecognition.js";
+import { useMixedAudio } from "./hooks/useMixedAudio.js";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
 
 // How often (ms) to ship a buffered PCM chunk to Groq Whisper in
-// Hindi + System Audio mode. Whisper is "fast batch" not streaming, so
-// we trade a little latency for accuracy: 4 s gives Whisper enough
-// context to handle code-switching and avoids cutting words mid-syllable
-// too often, while still feeling roughly live.
+// Hindi mode. Whisper is "fast batch" not streaming, so we trade a
+// little latency for accuracy: 4 s gives Whisper enough context to
+// handle code-switching without cutting words mid-syllable too often,
+// while still feeling roughly live.
 const HINDI_CHUNK_MS = 4000;
-// Drop chunks shorter than ~0.3 s of audio (16 kHz mono int16 = 32 B/ms)
-// — Whisper struggles on tiny clips and they often produce hallucinations.
+// Drop chunks shorter than ~0.3 s (Whisper struggles on tiny clips
+// and tends to hallucinate).
 const HINDI_MIN_BYTES = 16000 * 2 * 0.3;
-// Silence threshold for the chunk's normalized RMS (0..1, where 1 is
-// full scale). When the captured audio is below this, we don't ship the
-// chunk to Whisper at all — it would otherwise hallucinate things like
-// "झाल" or "Thanks for watching" on near-silent input. Tuned so quiet
-// ambient noise from a tab still passes, but the YouTube "preroll
-// silence" / muted-tab case is dropped. Override at build time with
-// VITE_HINDI_SILENCE_RMS if you need a different threshold for your
-// environment.
+// Silence threshold for the chunk's normalized RMS (0..1). Below this,
+// the chunk isn't sent to Whisper at all — same gate that keeps the
+// app from burning Groq quota on silent stretches and getting
+// silence-induced hallucinations back. Override at build time with
+// VITE_HINDI_SILENCE_RMS if needed.
 const HINDI_SILENCE_RMS = (() => {
   const raw = import.meta.env.VITE_HINDI_SILENCE_RMS;
   const n = parseFloat(raw);
   return Number.isFinite(n) && n >= 0 ? n : 0.01;
 })();
 
-/**
- * Normalized RMS of a PCM16-LE ArrayBuffer in [0, 1]. Used as a cheap
- * voice-activity check on Hindi+System chunks before we spend a Whisper
- * request on them. Returns 0 for an empty buffer.
- */
+// Two language modes:
+//
+//   "en" — AssemblyAI Universal-Streaming. Audio is forwarded
+//          continuously over the WS as binary PCM and AAI emits
+//          transcripts.
+//
+//   "hi" — Groq Whisper, batched. Audio is buffered into ~4 s
+//          chunks; each non-silent chunk is shipped via the
+//          existing {type:"hindi_chunk"} control message; the server
+//          calls Whisper for STT and the existing Translator for
+//          Hindi → English. The UI rendering shape (Hindi line + an
+//          English translation underneath) is identical to what the
+//          old browser-Web-Speech path produced.
+//
+// In both modes the audio source is the new mixed stream: system
+// audio (always) plus the optional microphone (toggled from the
+// floating widget). Backend is the same — it just sees PCM coming
+// from the browser, doesn't know or care that mic was added.
+const LANGS = {
+  en: { label: "English" },
+  hi: { label: "Hindi" },
+};
+
 function computePcm16Rms(arrayBuffer) {
   const view = new Int16Array(arrayBuffer);
   if (view.length === 0) return 0;
   let sumSq = 0;
   for (let i = 0; i < view.length; i++) {
-    const v = view[i] / 32768; // normalize to [-1, 1]
+    const v = view[i] / 32768;
     sumSq += v * v;
   }
   return Math.sqrt(sumSq / view.length);
 }
 
-// Two language modes:
-//
-//   "en" — uses the existing AssemblyAI Universal-Streaming pipeline.
-//          Audio captured by useMicrophone or useSystemAudio -> sent
-//          over WS as binary PCM -> AAI -> server emits transcript /
-//          translation frames.
-//
-//   "hi" — Hindi. Two sub-modes depending on the audio source:
-//
-//          - Hindi + Microphone: uses the browser's Web Speech API
-//            (`hi-IN`). Recognition happens locally; finals are
-//            appended via addLocalFinal and shipped to the server with
-//            `{type:"translate"}` so Groq does the Hindi -> English
-//            translation step.
-//
-//          - Hindi + System Audio: the Web Speech API can't ingest a
-//            getDisplayMedia stream, so we capture system audio
-//            (YouTube tab, Meet call, etc.) into the same PCM
-//            pipeline as English mode and ship buffered ~4 s chunks
-//            to the server with `{type:"hindi_chunk"}`. The server
-//            calls Groq Whisper (Hindi STT) and then Groq Llama
-//            (Hindi -> English translation) and emits the same
-//            transcript + translation frames the UI already knows
-//            how to render.
-const LANGS = {
-  en: { label: "English", recogLang: null /* AAI */ },
-  hi: { label: "Hindi", recogLang: "hi-IN" /* browser */ },
-};
-
-// Two audio sources. Both are now valid in both languages.
-const SOURCES = {
-  mic: { label: "Microphone" },
-  system: { label: "System Audio" },
-};
-
 export default function App() {
   const [language, setLanguage] = useState("en");
-  const [audioSource, setAudioSource] = useState("mic");
 
   const {
     status,
@@ -95,26 +73,19 @@ export default function App() {
     stopSession,
     sendAudio,
     clearTranscripts,
-    addLocalFinal,
-    setLocalInterim,
-    requestTranslation,
     requestHindiChunk,
   } = useTranscriptSocket(WS_URL);
 
-  // ---- mode helpers --------------------------------------------------------
-
-  const wsConnected = status === "connected";
-  const isHindi = language === "hi";
-  const isSystemAudio = audioSource === "system";
-  const isHindiSystem = isHindi && isSystemAudio;
-
-  // ---- Hindi + System Audio: buffered chunked path ------------------------
-  // While this mode is active, every PCM chunk from useSystemAudio is
-  // appended to a buffer instead of going straight onto the WS. A
-  // periodic timer flushes the buffer to the server as one binary
-  // payload + a {type:"hindi_chunk", id} JSON envelope.
+  // ---- Hindi chunk buffer (preserved from previous releases) -------------
 
   const hindiBufferRef = useRef([]);
+  // Track the current language inside a ref so the audio sink, which
+  // is bound into the AudioWorklet's onmessage handler at start time,
+  // sees the latest value without us having to re-attach the worklet.
+  const langRef = useRef(language);
+  useEffect(() => {
+    langRef.current = language;
+  }, [language]);
 
   const flushHindiChunk = useCallback(() => {
     const chunks = hindiBufferRef.current;
@@ -131,13 +102,9 @@ export default function App() {
       offset += c.byteLength;
     }
 
-    // Voice-activity gate. Whisper is famous for hallucinating things
-    // like "झाल" or "Thanks for watching" when given near-silent
-    // audio — the model has heard a lot of YouTube credit tails during
-    // training and falls back to them on quiet input. The cleanest fix
-    // is to never give it silent audio: if this chunk's RMS is below
-    // the threshold, we drop it on the floor instead of spending a
-    // Groq request on it.
+    // Voice-activity gate. Whisper hallucinates short Hindi or English
+    // credit-tail words on near-silent audio; if RMS is below the
+    // threshold we drop the chunk before spending a Groq request.
     const rms = computePcm16Rms(combined.buffer);
     if (rms < HINDI_SILENCE_RMS) {
       // eslint-disable-next-line no-console
@@ -147,31 +114,15 @@ export default function App() {
       return;
     }
 
-    const id = `hi-sys-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 7)}`;
+    const id = `hi-sys-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     requestHindiChunk(id, combined.buffer);
   }, [requestHindiChunk]);
 
-  // ---- Audio chunk sink (shared by mic and system-audio paths) ------------
-  // Both capture hooks call into this with the same PCM16 ArrayBuffer
-  // shape; the host picks where the chunks go based on the current mode.
-  // Crucially, the English paths (mic and system) and Hindi + Mic
-  // remain byte-identical to before — they all hit `sendAudio(buffer)`.
-  // Only Hindi + System Audio takes the buffered branch.
-
-  // Track the current mode in a ref so the audio callback (which is
-  // referenced from inside the AudioWorklet's onmessage closure) sees
-  // the latest values without the worklet needing to be re-attached
-  // every time the mode changes.
-  const modeRef = useRef({ isHindiSystem });
-  useEffect(() => {
-    modeRef.current.isHindiSystem = isHindiSystem;
-  }, [isHindiSystem]);
+  // ---- audio sink: routes mixed PCM by language --------------------------
 
   const handleAudio = useCallback(
     (buffer) => {
-      if (modeRef.current.isHindiSystem) {
+      if (langRef.current === "hi") {
         hindiBufferRef.current.push(buffer);
       } else {
         sendAudio(buffer);
@@ -180,212 +131,150 @@ export default function App() {
     [sendAudio]
   );
 
-  // ---- English / AAI mic path (UNCHANGED from previous releases) ----------
+  // ---- the unified mic+system capture ------------------------------------
 
   const {
-    active: micActive,
-    error: micError,
-    start: startMic,
-    stop: stopMic,
-  } = useMicrophone(handleAudio);
+    systemActive,
+    micActive,
+    error: audioError,
+    micDevices,
+    micDeviceId,
+    setMicDeviceId,
+    startSystem,
+    stopSystem,
+    enableMic,
+    disableMic,
+  } = useMixedAudio(handleAudio);
 
-  // ---- System-audio capture (used by both English+System and Hindi+System)
+  // ---- mode helpers ------------------------------------------------------
 
-  const {
-    active: sysActive,
-    error: sysError,
-    start: startSys,
-    stop: stopSys,
-  } = useSystemAudio(handleAudio);
+  const wsConnected = status === "connected";
+  const translating = systemActive;
+  const isHindi = language === "hi";
 
-  // ---- Hindi / browser SpeechRecognition path (Hindi + Mic only) ----------
+  // ---- start / stop translation ------------------------------------------
 
-  const handleHindiFinal = useCallback(
-    (text) => {
-      const id = addLocalFinal(text);
-      if (id) requestTranslation(id, text);
-    },
-    [addLocalFinal, requestTranslation]
-  );
-
-  const handleHindiInterim = useCallback(
-    (text) => {
-      setLocalInterim(text);
-    },
-    [setLocalInterim]
-  );
-
-  const {
-    supported: recogSupported,
-    active: recogActive,
-    error: recogError,
-    start: startRecog,
-    stop: stopRecog,
-  } = useSpeechRecognition({
-    lang: LANGS[language].recogLang || "en-US",
-    onFinal: handleHindiFinal,
-    onInterim: handleHindiInterim,
-  });
-
-  // ---- recording state -----------------------------------------------------
-
-  // What is "currently capturing"? The button label / disabled state
-  // and the "stop everything" effects all key off this.
-  const recording = isHindiSystem
-    ? sysActive
-    : isHindi
-    ? recogActive
-    : isSystemAudio
-    ? sysActive
-    : micActive;
-
-  const canStart = isHindiSystem
-    ? wsConnected // need WS to ship chunks to Whisper
-    : isHindi
-    ? recogSupported // browser STT path doesn't need WS to be up
-    : wsConnected;
-
-  // ---- start / stop branching ---------------------------------------------
-
-  const handleStart = useCallback(async () => {
-    if (isHindiSystem) {
-      // NEW path. Order mirrors English+System: capture FIRST so a
-      // cancelled share picker doesn't leave anything dangling. We do
-      // NOT call startSession() — the AAI session is for the streaming
-      // English flow; Hindi chunks are standalone Whisper requests
-      // dispatched per chunk by `requestHindiChunk`.
-      if (!wsConnected) return;
-      const ok = await startSys();
-      if (!ok) return;
-      return;
-    }
-    if (isHindi) {
-      // Hindi + Mic — UNCHANGED.
-      await startRecog();
-      return;
-    }
-    if (isSystemAudio) {
-      // English + System — UNCHANGED.
-      if (!wsConnected) return;
-      const ok = await startSys();
-      if (!ok) return;
-      startSession();
-      return;
-    }
-    // English + Mic — UNCHANGED order/logic from previous releases.
+  const handleStartTranslation = useCallback(async () => {
     if (!wsConnected) return;
-    startSession();
-    await startMic();
-  }, [
-    isHindiSystem,
-    isHindi,
-    isSystemAudio,
-    startRecog,
-    startSys,
-    wsConnected,
-    startSession,
-    startMic,
-  ]);
-
-  const handleStop = useCallback(async () => {
-    if (isHindiSystem) {
-      // NEW path. Stop the system-audio capture; the chunk-flush
-      // effect's cleanup will do a final flush of any buffered tail.
-      await stopSys();
-      return;
+    // Open the AAI session BEFORE starting capture in English mode so
+    // server-side state is ready by the time the first PCM chunk
+    // arrives. (This mirrors the previous English+Mic flow byte for
+    // byte; the only thing that changes is that the audio source is
+    // now `useMixedAudio` instead of `useMicrophone`.)
+    if (language === "en") {
+      startSession();
     }
-    if (isHindi) {
-      stopRecog();
-      return;
-    }
-    if (isSystemAudio) {
-      await stopSys();
+    const ok = await startSystem();
+    if (!ok && language === "en") {
+      // User cancelled the share picker or sharing failed — close
+      // the session we just opened so we don't burn AAI quota
+      // waiting for audio that's never going to arrive.
       stopSession();
+    }
+  }, [wsConnected, language, startSession, startSystem, stopSession]);
+
+  const handleStopTranslation = useCallback(async () => {
+    await stopSystem();
+    // Always send stop — server happily ignores it when there's no
+    // active session.
+    stopSession();
+  }, [stopSystem, stopSession]);
+
+  // ---- mic toggle (driven by the floating widget) ------------------------
+
+  const handleToggleMic = useCallback(async () => {
+    if (micActive) {
+      await disableMic();
+    } else {
+      await enableMic(micDeviceId || undefined);
+    }
+  }, [micActive, micDeviceId, enableMic, disableMic]);
+
+  // Item 8: closing the floating widget should stop mic capture
+  // (system audio keeps running). useMixedAudio.disableMic() is
+  // idempotent.
+  const handleWidgetClose = useCallback(() => {
+    if (micActive) {
+      disableMic();
+    }
+  }, [micActive, disableMic]);
+
+  // ---- effects: keep state coherent --------------------------------------
+
+  // When system audio stops on its own (user clicked the browser's
+  // "Stop sharing" indicator, or the source tab was closed), make sure
+  // we also tear down the AAI session. useMixedAudio's stopSystem
+  // sets systemActive=false; this effect catches that transition.
+  const wasTranslatingRef = useRef(false);
+  useEffect(() => {
+    if (systemActive) {
+      wasTranslatingRef.current = true;
       return;
     }
-    // Mic path — UNCHANGED.
-    await stopMic();
-    stopSession();
-  }, [
-    isHindiSystem,
-    isHindi,
-    isSystemAudio,
-    stopRecog,
-    stopSys,
-    stopMic,
-    stopSession,
-  ]);
+    if (wasTranslatingRef.current) {
+      wasTranslatingRef.current = false;
+      // Final flush of any tail Hindi audio before resetting.
+      flushHindiChunk();
+      hindiBufferRef.current = [];
+      stopSession();
+    }
+  }, [systemActive, flushHindiChunk, stopSession]);
 
-  // While Hindi+System is actively capturing, run a periodic flush
-  // timer. The cleanup also does a final flush so the tail of the
-  // recording isn't lost when the user clicks Stop.
+  // Periodic Hindi chunk flush while translating in Hindi mode.
   useEffect(() => {
-    if (!(isHindiSystem && sysActive)) return;
-    const timer = setInterval(flushHindiChunk, HINDI_CHUNK_MS);
+    if (!(isHindi && systemActive)) return;
+    const t = setInterval(flushHindiChunk, HINDI_CHUNK_MS);
     return () => {
-      clearInterval(timer);
+      clearInterval(t);
       flushHindiChunk();
       hindiBufferRef.current = [];
     };
-  }, [isHindiSystem, sysActive, flushHindiChunk]);
+  }, [isHindi, systemActive, flushHindiChunk]);
 
-  // If the server connection drops, release whichever WS-dependent
-  // capture is running so we don't keep producing audio that has
-  // nowhere to go. Hindi+Mic is independent of the WS — only the
-  // translation step is, and it gracefully no-ops while disconnected.
+  // If the WS drops while translating, release the capture so we
+  // don't keep producing audio that has nowhere to go. Auto-reconnect
+  // is in useTranscriptSocket; the user just clicks Start again.
   useEffect(() => {
-    if (wsConnected) return;
-    if (micActive) stopMic();
-    if (sysActive) stopSys();
-  }, [wsConnected, micActive, sysActive, stopMic, stopSys]);
+    if (!wsConnected && systemActive) {
+      stopSystem();
+    }
+  }, [wsConnected, systemActive, stopSystem]);
 
-  // Stop all captures when the user switches language or audio source
-  // so we never end up with two sources running at once. Also clear
-  // any leftover Hindi chunk buffer so a stale tail doesn't get sent
-  // under the wrong mode after the switch.
+  // Switching language mid-session: stop the capture so we never end
+  // up in a half-translated state, and clear any queued Hindi tail.
   useEffect(() => {
-    if (micActive) stopMic();
-    if (sysActive) stopSys();
-    if (recogActive) stopRecog();
+    if (systemActive) stopSystem();
     hindiBufferRef.current = [];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [language, audioSource]);
+  }, [language]);
 
-  const errorMessage = serverError || micError || sysError || recogError;
+  // Switching mic device while mic is on is handled inside
+  // useMixedAudio.setMicDeviceId — it disables and re-enables the mic
+  // on the new device. When mic is off we just remember the choice.
 
-  const hindiUnsupportedNote =
-    isHindi && !isSystemAudio && !recogSupported
-      ? "Your browser doesn't support speech recognition. Hindi mic mode works best in Chrome or Edge."
-      : null;
+  const errorMessage = serverError || audioError;
 
-  const hindiTranslationDisconnectedNote =
-    isHindi && !isSystemAudio && recogActive && !wsConnected
-      ? "Recording locally — translations will resume when the server reconnects."
-      : null;
+  // Microphone device labels are only populated once permission has
+  // been granted at least once. Before that, we still show the entries
+  // but with placeholder labels so the user can pick something.
+  const micOptions = (() => {
+    const items = micDevices.map((d, i) => ({
+      id: d.deviceId,
+      label: d.label || `Microphone ${i + 1}`,
+    }));
+    return [{ id: "", label: "Default microphone" }, ...items];
+  })();
 
-  // Tells the user *what* they need to tick in the share picker. Only
-  // shown while system-audio mode is selected and not yet capturing.
-  const systemAudioHint =
-    isSystemAudio && !sysActive
-      ? 'When the share picker opens, choose a Tab or Entire Screen and tick "Share tab audio" / "Share system audio".'
-      : null;
-
-  // Hindi+System has noticeably higher latency than the streaming
-  // paths because Whisper batches per chunk. Tell the user once.
-  const hindiSystemLatencyNote =
-    isHindiSystem && sysActive
-      ? "Captions appear about every " +
-        HINDI_CHUNK_MS / 1000 +
-        " seconds (Whisper batches Hindi audio in chunks)."
-      : null;
-
-  // Source-aware button label / panel subtitle.
-  const buttonNoun = isSystemAudio ? "System Audio" : "Microphone";
-  const panelSubtitle = isHindiSystem
-    ? `${LANGS[language].label} (Whisper · ${SOURCES[audioSource].label})`
-    : isHindi
-    ? `${LANGS[language].label} (browser STT)`
-    : `${LANGS[language].label} (AssemblyAI · ${SOURCES[audioSource].label})`;
+  // Status string under the transcript header.
+  const panelSubtitle = (() => {
+    const langLabel = LANGS[language].label;
+    const provider = isHindi ? "Whisper" : "AssemblyAI";
+    if (!translating) {
+      return `${langLabel} (${provider})`;
+    }
+    const sources = micActive ? "System Audio + Microphone" : "System Audio";
+    return `${langLabel} (${provider} · ${sources})`;
+  })();
 
   return (
     <div
@@ -400,25 +289,10 @@ export default function App() {
             <select
               value={language}
               onChange={(e) => setLanguage(e.target.value)}
-              disabled={recording}
+              disabled={translating}
               className="bg-slate-800 border border-slate-600 rounded-md px-2 py-1 text-white disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {Object.entries(LANGS).map(([code, { label }]) => (
-                <option key={code} value={code}>
-                  {label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2">
-            <span className="text-slate-300">Source</span>
-            <select
-              value={audioSource}
-              onChange={(e) => setAudioSource(e.target.value)}
-              disabled={recording}
-              className="bg-slate-800 border border-slate-600 rounded-md px-2 py-1 text-white disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {Object.entries(SOURCES).map(([code, { label }]) => (
                 <option key={code} value={code}>
                   {label}
                 </option>
@@ -434,9 +308,7 @@ export default function App() {
             />
             <span className="text-slate-200">
               Status:{" "}
-              <span
-                className={wsConnected ? "text-emerald-400" : "text-red-400"}
-              >
+              <span className={wsConnected ? "text-emerald-400" : "text-red-400"}>
                 {wsConnected ? "Connected" : "Disconnected"}
               </span>
             </span>
@@ -445,6 +317,27 @@ export default function App() {
       </header>
 
       <main className="flex-1 min-h-0 p-6 flex flex-col gap-4">
+        {/* Microphone device selector — choosing here only takes effect
+            when the floating widget actually turns the mic on. */}
+        <label className="flex items-center gap-2 text-sm flex-wrap">
+          <span className="text-slate-300">Microphone</span>
+          <select
+            value={micDeviceId}
+            onChange={(e) => setMicDeviceId(e.target.value)}
+            className="bg-slate-800 border border-slate-600 rounded-md px-2 py-1 text-white max-w-xs truncate"
+            title="Used when the floating mic widget turns the mic on"
+          >
+            {micOptions.map((d) => (
+              <option key={d.id || "__default__"} value={d.id}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+          <span className="text-xs text-slate-500">
+            (used when you turn the mic ON in the floating widget)
+          </span>
+        </label>
+
         <div className="flex items-center justify-between flex-wrap gap-3">
           <h2 className="text-lg font-medium text-slate-300">
             Live Transcript{" "}
@@ -452,7 +345,7 @@ export default function App() {
               · {panelSubtitle}
             </span>
           </h2>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <button
               type="button"
               onClick={clearTranscripts}
@@ -461,24 +354,32 @@ export default function App() {
             >
               Clear
             </button>
-            {recording ? (
+            {translating ? (
               <button
                 type="button"
-                onClick={handleStop}
+                onClick={handleStopTranslation}
                 className="px-4 py-2 rounded-md text-sm font-medium bg-red-600 hover:bg-red-500 transition-colors"
               >
-                Stop {buttonNoun}
+                Stop Translation
               </button>
             ) : (
               <button
                 type="button"
-                onClick={handleStart}
-                disabled={!canStart}
+                onClick={handleStartTranslation}
+                disabled={!wsConnected}
                 className="px-4 py-2 rounded-md text-sm font-medium bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors"
               >
-                Start {buttonNoun}
+                Start Translation
               </button>
             )}
+            <FloatingMicWidget
+              micActive={micActive}
+              onMicToggle={handleToggleMic}
+              onClose={handleWidgetClose}
+              translationActive={translating}
+              wsConnected={wsConnected}
+              micError={audioError}
+            />
           </div>
         </div>
 
@@ -488,33 +389,26 @@ export default function App() {
           </div>
         ) : null}
 
-        {hindiUnsupportedNote ? (
-          <div className="px-4 py-2 rounded-md bg-amber-950/60 border border-amber-800 text-amber-200 text-sm">
-            {hindiUnsupportedNote}
-          </div>
-        ) : null}
-
-        {systemAudioHint ? (
+        {!translating ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
-            {systemAudioHint}
+            Click <span className="font-medium">Start Translation</span> and pick a
+            tab (or "Entire Screen") in the share picker. Tick{" "}
+            <span className="font-medium">Share tab audio</span> /{" "}
+            <span className="font-medium">Share system audio</span>. Then open the
+            mic widget if you also want to capture your own voice.
           </div>
         ) : null}
 
-        {!isHindi && (micActive || sysActive) && sessionStatus !== "ready" ? (
+        {translating && !isHindi && sessionStatus !== "ready" ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
             Connecting to AssemblyAI…
           </div>
         ) : null}
 
-        {hindiSystemLatencyNote ? (
+        {translating && isHindi ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
-            {hindiSystemLatencyNote}
-          </div>
-        ) : null}
-
-        {hindiTranslationDisconnectedNote ? (
-          <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
-            {hindiTranslationDisconnectedNote}
+            Captions appear about every {HINDI_CHUNK_MS / 1000} seconds (Whisper
+            batches Hindi audio in chunks).
           </div>
         ) : null}
 
