@@ -25,9 +25,14 @@ const RECONNECT_DELAY_MS = 3000;
  * Returns:
  *   status        : "connected" | "disconnected"
  *   sessionStatus : "idle" | "ready" | "stopped" | "error"
- *   finals        : Array<{id, text, translation: string|null, source}>
+ *   finals        : Array<{id, text, translation: string|null, source, createdAt}>
  *                   append-only; `translation` filled in when the
- *                   backend translation step completes.
+ *                   backend translation step completes; `createdAt`
+ *                   is the millisecond client-side timestamp when
+ *                   the line was inserted into state — used by the
+ *                   App's merge sort to render mic and system finals
+ *                   in chronological order without anything jumping
+ *                   upward later.
  *   interim       : string   current in-progress turn
  *   error         : string | null
  *
@@ -116,7 +121,18 @@ export function useTranscriptSocket(url, source = "system") {
 
             setFinals((prev) => [
               ...prev,
-              { id, text: msg.text, translation: null, source: sourceRef.current },
+              {
+                id,
+                text: msg.text,
+                translation: null,
+                source: sourceRef.current,
+                // Client-side timestamp set ONCE at insertion time.
+                // Used by the App's merge sort to render the two
+                // sockets' finals in chronological order. Never
+                // mutated afterwards — translation updates spread
+                // {...line} so this value is preserved.
+                createdAt: Date.now(),
+              },
             ]);
             setInterim("");
           } else {
@@ -217,7 +233,13 @@ export function useTranscriptSocket(url, source = "system") {
     const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     setFinals((prev) => [
       ...prev,
-      { id, text: trimmed, translation: null, source: sourceRef.current },
+      {
+        id,
+        text: trimmed,
+        translation: null,
+        source: sourceRef.current,
+        createdAt: Date.now(),
+      },
     ]);
     setInterim("");
     return id;

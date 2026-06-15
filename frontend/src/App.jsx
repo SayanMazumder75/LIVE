@@ -131,22 +131,22 @@ export default function App() {
   const isHindi = language === "hi";
 
   // Merge finals from both sockets into one append-ordered list.
-  // We use a simple concat + stable sort by the array index (insertion
-  // order) so the UI reflects when lines arrived relative to each other.
-  // Since both arrays are already in insertion order and React batches
-  // state updates, we interleave by keeping both arrays separate in
-  // TranscriptPanel if needed — but for now a flat concat is correct
-  // because each socket's array is already time-ordered and the combined
-  // stream is shown newest-at-bottom.
+  // Each line carries an explicit `createdAt` (set once at insertion
+  // time inside useTranscriptSocket and preserved across translation
+  // updates), so the merge is just a chronological sort.
+  //
+  // JS's Array.prototype.sort is stable, so two lines with identical
+  // timestamps preserve their relative input order — that's why we
+  // never need a tie-breaker. The previous regex-on-id implementation
+  // produced 0 for every Hindi-style id (which starts with letters)
+  // and partial digits for the UUID-hex English ids, so anything that
+  // wasn't a tied 0 effectively shuffled lines around when a new
+  // line arrived. Replaced with the explicit numeric timestamp.
   const mergedFinals = useMemo(
-    () => [...sysSocket.finals, ...micSocket.finals].sort((a, b) => {
-      // Both ids encode creation time in their prefix.
-      // Primary sort: numeric prefix extracted from the id string.
-      // Fallback: original array position (stable).
-      const tsA = parseInt(a.id.replace(/\D.*/, ""), 10) || 0;
-      const tsB = parseInt(b.id.replace(/\D.*/, ""), 10) || 0;
-      return tsA - tsB;
-    }),
+    () =>
+      [...sysSocket.finals, ...micSocket.finals].sort(
+        (a, b) => (a.createdAt || 0) - (b.createdAt || 0)
+      ),
     [sysSocket.finals, micSocket.finals]
   );
 
