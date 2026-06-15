@@ -75,15 +75,43 @@ export default function App() {
   }, [sysSocket.requestHindiChunk]);
 
   // ── Hindi mic-audio buffer (drives micSocket) ───────────────────────────
-  // In Hindi + Mic mode the browser's Web Speech API does the STT locally,
-  // so the mic audio never needs Whisper. But if you ever want to route mic
-  // PCM through Whisper for Hindi too, the buffer + flush is wired here.
-  // For now the mic socket in Hindi mode uses the Web Speech / requestTranslation
-  // path (same as before), so this is a no-op placeholder.
-  //
-  // NOTE: Hindi + Mic via Web Speech API still calls micSocket.addLocalFinal
-  // and micSocket.requestTranslation from FloatingMicWidget / its parent —
-  // that path is unchanged; it never goes through the audio pipeline.
+  // Mirror image of the system-audio buffer above. The previous version
+  // of this hook routed mic PCM straight onto micSocket.sendAudio in
+  // Hindi mode too, but that path requires an open AAI English session
+  // -- which Hindi mode never opens -- so the audio fell on the floor
+  // and Hindi+Mic produced no captions. Buffering mic chunks and
+  // flushing them through micSocket.requestHindiChunk uses the same
+  // Whisper code path the system-audio side uses; the backend treats
+  // both /audio/transcriptions calls identically (language="hi"
+  // hard-coded in stt.transcribe).
+  const hindiMicBufRef = useRef([]);
+
+  const flushHindiMicChunk = useCallback(() => {
+    const chunks = hindiMicBufRef.current;
+    if (chunks.length === 0) return;
+    hindiMicBufRef.current = [];
+
+    const totalBytes = chunks.reduce((s, c) => s + c.byteLength, 0);
+    if (totalBytes < HINDI_MIN_BYTES) return;
+
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const c of chunks) {
+      combined.set(new Uint8Array(c), offset);
+      offset += c.byteLength;
+    }
+
+    const rms = computePcm16Rms(combined.buffer);
+    if (rms < HINDI_SILENCE_RMS) {
+      console.info(
+        `[hindi-mic] skipping silent chunk (rms=${rms.toFixed(4)} < ${HINDI_SILENCE_RMS})`
+      );
+      return;
+    }
+
+    const id = `hi-mic-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    micSocket.requestHindiChunk(id, combined.buffer);
+  }, [micSocket.requestHindiChunk]);
 
   // ── Audio pipeline callbacks ────────────────────────────────────────────
 
@@ -100,11 +128,16 @@ export default function App() {
 
   const handleMicAudio = useCallback(
     (buffer) => {
-      // Mic audio always goes to micSocket as raw PCM (English mode).
-      // Hindi + Mic uses Web Speech API, so the audio worklet is idle
-      // in that mode (the mic track runs but no stream is sent because
-      // micSocket.startSession() is not called for Hindi).
-      micSocket.sendAudio(buffer);
+      // Symmetric with handleSystemAudio: in Hindi mode the chunk
+      // goes to the Whisper buffer; in English mode it streams to
+      // the mic socket's AAI session. Without this branch, Hindi+Mic
+      // sent PCM to a socket that never opened an AAI session and
+      // produced no transcripts (the bug PHASE 3 Part B was about).
+      if (langRef.current === "hi") {
+        hindiMicBufRef.current.push(buffer);
+      } else {
+        micSocket.sendAudio(buffer);
+      }
     },
     [micSocket.sendAudio]
   );
@@ -214,7 +247,7 @@ export default function App() {
     micSocket.clearTranscripts();
   }, [sysSocket.clearTranscripts, micSocket.clearTranscripts]);
 
-  // ── Hindi system-audio flush intervals ──────────────────────────────────
+  // ── Hindi flush intervals (system + microphone) ─────────────────────────
 
   const wasTranslatingRef = useRef(false);
   useEffect(() => {
@@ -226,10 +259,18 @@ export default function App() {
       wasTranslatingRef.current = false;
       flushHindiSysChunk();
       hindiSysBufRef.current = [];
+      flushHindiMicChunk();
+      hindiMicBufRef.current = [];
       sysSocket.stopSession();
       micSocket.stopSession();
     }
-  }, [systemActive, flushHindiSysChunk, sysSocket.stopSession, micSocket.stopSession]);
+  }, [
+    systemActive,
+    flushHindiSysChunk,
+    flushHindiMicChunk,
+    sysSocket.stopSession,
+    micSocket.stopSession,
+  ]);
 
   useEffect(() => {
     if (!(isHindi && systemActive)) return;
@@ -240,6 +281,22 @@ export default function App() {
       hindiSysBufRef.current = [];
     };
   }, [isHindi, systemActive, flushHindiSysChunk]);
+
+  // Mirror flush timer for the mic. Without this, Hindi audio captured
+  // from the microphone would just pile up in the buffer and never be
+  // sent to Whisper -- which is exactly the symptom PHASE 3 Part B is
+  // about. Tied to micActive so it runs only while the mic is on, and
+  // does a final flush on cleanup so the tail of speech isn't lost
+  // when the user toggles the mic off.
+  useEffect(() => {
+    if (!(isHindi && micActive)) return;
+    const t = setInterval(flushHindiMicChunk, HINDI_CHUNK_MS);
+    return () => {
+      clearInterval(t);
+      flushHindiMicChunk();
+      hindiMicBufRef.current = [];
+    };
+  }, [isHindi, micActive, flushHindiMicChunk]);
 
   // Stop everything when WS drops.
   useEffect(() => {
@@ -252,6 +309,7 @@ export default function App() {
   useEffect(() => {
     if (systemActive) stopSystem();
     hindiSysBufRef.current = [];
+    hindiMicBufRef.current = [];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [language]);
 
