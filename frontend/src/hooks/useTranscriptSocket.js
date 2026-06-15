@@ -3,15 +3,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const RECONNECT_DELAY_MS = 3000;
 
 /**
- * Manages the WebSocket connection to the transcription bridge.
+ * Manages one WebSocket connection to the transcription bridge.
  *
- * Each `useEffect` run owns its own closure-scoped state (`destroyed`,
- * `currentWs`, `reconnectTimer`). The WebSocket event handlers compare
- * the firing socket against `currentWs` before mutating React state, so
- * a late `onclose` from a cancelled connection cannot affect the current
- * one. This is what makes the hook safe under React 18 StrictMode dev
- * mode (where effects mount → cleanup → mount in quick succession) and
- * under genuine reconnects.
+ * In Option-B each source (system / mic) gets its own socket instance,
+ * so `source` is injected at construction time as a plain string
+ * ("system" | "mic") and stamped on every final transcript line.
+ * No dynamic `getSource` callback is needed — the identity of the
+ * socket IS the source.
  *
  * Dev-mode WebSocket warning
  * --------------------------
@@ -27,37 +25,45 @@ const RECONNECT_DELAY_MS = 3000;
  * Returns:
  *   status        : "connected" | "disconnected"
  *   sessionStatus : "idle" | "ready" | "stopped" | "error"
- *   finals        : Array<{id, text, translation: string|null}>
- *                   append-only finalized lines; `translation` may be
- *                   filled in later when the backend's Gemini step
- *                   completes (or stay null if not configured / no-op).
- *   interim       : string                current in-progress turn
+ *   finals        : Array<{id, text, translation: string|null, source}>
+ *                   append-only; `translation` filled in when the
+ *                   backend translation step completes.
+ *   interim       : string   current in-progress turn
  *   error         : string | null
  *
  *   startSession() / stopSession() / sendAudio(buffer) / clearTranscripts()
  *
- * Hindi-mode helpers (used when the browser does the recognition
- * locally because AAI doesn't support the language):
+ * Hindi-mode helpers:
  *   addLocalFinal(text)       — append a finalized line, returns its id
  *   setLocalInterim(text)     — overwrite the current in-progress line
  *   requestTranslation(id, t) — ask the backend to translate `t` and
  *                                attach the result to the line `id`
+ *   requestHindiChunk(id, ab) — two-step send for Hindi system audio
+ *
+ * @param {string} url     WebSocket URL
+ * @param {"system"|"mic"} source  Stamped on every final line produced
+ *                                  by this socket instance.
  */
-export function useTranscriptSocket(url) {
+export function useTranscriptSocket(url, source = "system") {
   const [status, setStatus] = useState("disconnected");
   const [sessionStatus, setSessionStatus] = useState("idle");
   const [finals, setFinals] = useState([]);
   const [interim, setInterim] = useState("");
   const [error, setError] = useState(null);
 
-  // Read by the imperative API (`startSession` / `sendAudio` / ...).
   const wsRef = useRef(null);
+
+  // Keep source in a ref so the stable callbacks below always stamp the
+  // latest value without needing to be recreated.
+  const sourceRef = useRef(source);
+  useEffect(() => {
+    sourceRef.current = source;
+  }, [source]);
 
   useEffect(() => {
     let destroyed = false;
     let currentWs = null;
     let reconnectTimer = null;
-    let initialConnectScheduled = false;
 
     let connect = () => {};
 
@@ -103,16 +109,14 @@ export function useTranscriptSocket(url) {
 
         if (msg.type === "transcript" && typeof msg.text === "string") {
           if (msg.final) {
-            // Prefer the server-provided id so translation frames can
-            // attach to the right line. Fall back to a local id only
-            // if the server didn't send one (older backends).
             const id =
               typeof msg.id === "string" && msg.id
                 ? msg.id
                 : `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
             setFinals((prev) => [
               ...prev,
-              { id, text: msg.text, translation: null },
+              { id, text: msg.text, translation: null, source: sourceRef.current },
             ]);
             setInterim("");
           } else {
@@ -123,8 +127,6 @@ export function useTranscriptSocket(url) {
           typeof msg.id === "string" &&
           typeof msg.text === "string"
         ) {
-          // Attach the translation to the matching finalized line.
-          // No-op if the line is gone (e.g. user clicked Clear).
           setFinals((prev) =>
             prev.map((line) =>
               line.id === msg.id ? { ...line, translation: msg.text } : line
@@ -141,13 +143,10 @@ export function useTranscriptSocket(url) {
       };
 
       ws.onerror = () => {
-        // Browser fires `onclose` next; the reconnect path lives there.
+        // Browser fires `onclose` next; reconnect logic lives there.
       };
 
       ws.onclose = () => {
-        // Ignore close events for sockets we've already replaced or
-        // intentionally cancelled — this is the lock that fixes the
-        // StrictMode-dev double-mount race.
         if (ws !== currentWs) return;
 
         currentWs = null;
@@ -163,25 +162,14 @@ export function useTranscriptSocket(url) {
 
     connect = wrappedConnect;
 
-    // Defer the very first connect by a setTimeout(0) so StrictMode's
-    // dev-mode mount → cleanup → mount cycle (which runs synchronously)
-    // happens *before* we open a WebSocket. Without this delay, the
-    // first WebSocket would be cancelled mid-handshake during cleanup,
-    // and Chrome would log a benign but noisy "WebSocket is closed
-    // before the connection is established" warning. In production
-    // (no StrictMode double-invoke) this is just a one-tick delay.
     const initialConnectTimer = setTimeout(() => {
-      initialConnectScheduled = false;
       if (destroyed) return;
       connect();
     }, 0);
-    initialConnectScheduled = true;
 
     return () => {
       destroyed = true;
-      if (initialConnectScheduled) {
-        clearTimeout(initialConnectTimer);
-      }
+      clearTimeout(initialConnectTimer);
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -190,14 +178,12 @@ export function useTranscriptSocket(url) {
       currentWs = null;
       if (wsRef.current === ws) wsRef.current = null;
       if (ws) {
-        try {
-          ws.close();
-        } catch {
-          /* noop */
-        }
+        try { ws.close(); } catch { /* noop */ }
       }
     };
   }, [url]);
+
+  // ── imperative API ─────────────────────────────────────────────────────
 
   const startSession = useCallback(() => {
     const ws = wsRef.current;
@@ -223,13 +209,7 @@ export function useTranscriptSocket(url) {
     setInterim("");
   }, []);
 
-  // --- Hindi-mode helpers --------------------------------------------------
-  // These let the UI inject locally-recognized transcripts (e.g. from the
-  // browser's Web Speech API) into the same `finals` / `interim` state that
-  // backend transcripts use, so the rendering layer doesn't have to know
-  // where the text came from. Translations are still requested via the
-  // server (`requestTranslation`) and arrive over the existing message
-  // channel as `{type:"translation", id, text}`.
+  // ── Hindi-mode helpers ─────────────────────────────────────────────────
 
   const addLocalFinal = useCallback((text) => {
     const trimmed = (text || "").trim();
@@ -237,7 +217,7 @@ export function useTranscriptSocket(url) {
     const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     setFinals((prev) => [
       ...prev,
-      { id, text: trimmed, translation: null },
+      { id, text: trimmed, translation: null, source: sourceRef.current },
     ]);
     setInterim("");
     return id;
@@ -254,11 +234,6 @@ export function useTranscriptSocket(url) {
     ws.send(JSON.stringify({ type: "translate", id, text }));
   }, []);
 
-  // Hindi + System Audio: ship a chunk of PCM bytes for Whisper to
-  // transcribe. Two-step send to keep the wire format simple — the
-  // server reads the JSON meta, then expects the very next binary
-  // frame to be the audio payload. WebSocket guarantees frame order
-  // on a single connection, so this is reliable.
   const requestHindiChunk = useCallback((id, audioBuffer) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -277,7 +252,6 @@ export function useTranscriptSocket(url) {
     stopSession,
     sendAudio,
     clearTranscripts,
-    // Hindi-mode helpers
     addLocalFinal,
     setLocalInterim,
     requestTranslation,
