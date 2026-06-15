@@ -150,9 +150,17 @@ export default function App() {
     [sysSocket.finals, micSocket.finals]
   );
 
-  // Use sysSocket interim for the primary display; mic interim is shown
-  // separately by FloatingMicWidget (or you can show both — see TranscriptPanel).
-  const mergedInterim = sysSocket.interim || micSocket.interim;
+  // Per-source interims. Each socket already owns its own interim
+  // state stamped with its source identity at emission time; we forward
+  // them to TranscriptPanel separately instead of collapsing them into
+  // one string. That way mic interim renders on the RIGHT (mic-styled)
+  // and sys interim renders on the LEFT (sys-styled) — fixing the
+  // "transcript appears as System and only later moves to Microphone"
+  // bug. The source is decided BEFORE rendering: the moment the
+  // micSocket / sysSocket onmessage handler stamps the line, not after.
+  const sysInterim = sysSocket.interim;
+  const micInterim = micSocket.interim;
+  const anyInterim = Boolean(sysInterim || micInterim);
 
   // ── Session lifecycle ────────────────────────────────────────────────────
 
@@ -346,7 +354,7 @@ export default function App() {
             <button
               type="button"
               onClick={clearTranscripts}
-              disabled={mergedFinals.length === 0 && !mergedInterim}
+              disabled={mergedFinals.length === 0 && !anyInterim}
               className="px-3 py-2 rounded-md text-sm font-medium bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed transition-colors"
             >
               Clear
@@ -410,7 +418,11 @@ export default function App() {
         ) : null}
 
         <div className="flex-1 min-h-0">
-          <TranscriptPanel finals={mergedFinals} interim={mergedInterim} />
+          <TranscriptPanel
+            finals={mergedFinals}
+            sysInterim={sysInterim}
+            micInterim={micInterim}
+          />
         </div>
       </main>
     </div>
