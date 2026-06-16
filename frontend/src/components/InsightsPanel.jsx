@@ -365,7 +365,35 @@ export default function InsightsPanel({
   const [insights, setInsights] = useState(initialInsights || null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [vault, setVault] = useState([]);
+  // When opening a saved meeting (savedView + initialInsights set),
+  // pre-populate the in-memory vault list with the meeting's
+  // existing snapshot so the Study Vault section looks exactly like
+  // it did right after the user originally clicked "Save Current
+  // Insights" — single entry, savedAt + lineCount + summary visible.
+  // Without this the section would say "No saved sessions yet" on a
+  // freshly-opened saved meeting, which contradicts the spec ("the
+  // page should look identical to when the meeting was originally
+  // generated").
+  const [vault, setVault] = useState(() => {
+    if (!initialInsights) return [];
+    const sv =
+      initialInsights.studyVault && typeof initialInsights.studyVault === "object"
+        ? initialInsights.studyVault
+        : null;
+    const savedAtIso = sv?.savedAt;
+    const savedAtLabel =
+      savedAtIso && !Number.isNaN(new Date(savedAtIso).getTime())
+        ? new Date(savedAtIso).toLocaleString()
+        : "Saved meeting";
+    return [
+      {
+        id: `restored-${savedAtIso || Date.now()}`,
+        savedAt: savedAtLabel,
+        lineCount: sv?.lineCount ?? (Array.isArray(finals) ? finals.length : 0),
+        ...initialInsights,
+      },
+    ];
+  });
   // In saved-session mode the meeting is already in MongoDB, so the
   // Save button starts in "saved" state until the user regenerates.
   const [saved, setSaved] = useState(savedView);
