@@ -266,8 +266,15 @@ export function useSessionPersistence(httpUrl) {
   // session record as the transcript, so a future GET /transcript/:id
   // returns the whole meeting in one query.
   const saveInsights = useCallback(
-    async (insights) => {
-      const id = sessionIdRef.current;
+    async (insights, explicitSessionId = null) => {
+      // `explicitSessionId` is supplied when the user is viewing a
+      // saved session in the main page and re-saves insights there —
+      // the write must target *that* session, not whichever live
+      // session is currently active. Falling back to the live id
+      // keeps the original "save during live recording" path working.
+      const id =
+        (typeof explicitSessionId === "string" && explicitSessionId.trim()) ||
+        sessionIdRef.current;
       if (!id) {
         const msg =
           "No active session. Click Start Translation first so the " +
@@ -325,18 +332,17 @@ export function useSessionPersistence(httpUrl) {
       try {
         const data = await _get(`/transcript/${encodeURIComponent(sid)}`);
         if (data === null) return null;
-        // Backend now returns {text, insights?}. Return the whole
-        // object so callers (SessionHistory) can show the saved AI
-        // sections in the same load — single query, full meeting.
-        // Stays backward-compatible: callers that only `.text` it
-        // still get the right field.
-        if (data && typeof data === "object" && "insights" in data) {
-          return {
-            text: typeof data.text === "string" ? data.text : "",
-            insights: data.insights || null,
-          };
+        // Always return the structured shape so callers can rely on
+        // `.text` and `.insights` regardless of whether the session
+        // had any AI Meeting Intelligence saved on it. Older records
+        // without `insights` get `insights: null`.
+        if (typeof data === "string") {
+          return { text: data, insights: null };
         }
-        return typeof data.text === "string" ? data.text : "";
+        return {
+          text: typeof data?.text === "string" ? data.text : "",
+          insights: data?.insights || null,
+        };
       } catch (e) {
         console.warn("[session] load /transcript failed:", e);
         setError(`Could not load session: ${e.message}`);

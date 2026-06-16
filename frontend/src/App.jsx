@@ -5,6 +5,7 @@ import SessionHistory from "./components/SessionHistory.jsx";
 import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
 import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
+import { parseSavedTranscript } from "./hooks/parseSavedTranscript.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
@@ -51,6 +52,17 @@ export default function App() {
   // pipeline.
   const persistence = useSessionPersistence(HTTP_URL);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // ── viewing a saved session ──────────────────────────────────────────
+  // When non-null the main page replaces the live transcript +
+  // insights with the saved meeting's data, rendered through the
+  // exact same TranscriptPanel + InsightsPanel components. Live
+  // recording, sockets, and audio capture keep running underneath
+  // — we just swap what the page is showing — so "Back to Live
+  // Session" is a state flip, not a restart.
+  //   { id, label, finals, insights, createdAt }
+  const [viewedSession, setViewedSession] = useState(null);
+  const [viewedLoading, setViewedLoading] = useState(false);
+  const [viewedError, setViewedError] = useState("");
 
   const langRef = useRef(language);
   useEffect(() => { langRef.current = language; }, [language]);
@@ -270,6 +282,79 @@ export default function App() {
     persistence.flushFinals(mergedFinals);
   }, [mergedFinals, persistence.flushFinals]);
 
+  // ── open a saved session in the main page ────────────────────────────
+  // The history drawer fires this when a row is clicked. The flow:
+  //   1. close the drawer (the drawer does this itself before calling
+  //      us, but we also tolerate being invoked directly)
+  //   2. fetch the session document (single GET — text + insights
+  //      come back together)
+  //   3. parse the stored `[SOURCE] [HH:MM:SS] text` lines back into
+  //      the same `finals` shape live sockets produce
+  //   4. set `viewedSession` so the main page swaps from live to saved
+  // The live audio + websocket pipelines are intentionally NOT
+  // touched. They keep accumulating finals in the background, ready
+  // for the user to flip back via "Back to Live Session".
+  const handleOpenSession = useCallback(
+    async (sessionId, meta) => {
+      if (!sessionId) return;
+      setHistoryOpen(false);
+      setViewedError("");
+      setViewedLoading(true);
+      try {
+        const result = await persistence.loadSession(sessionId);
+        if (!result) {
+          setViewedError(
+            "Could not load this session. The backend may not be configured for persistence."
+          );
+          setViewedSession(null);
+          return;
+        }
+        const text = result.text || "";
+        const insights = result.insights || null;
+        const finals = parseSavedTranscript(text, meta?.createdAt);
+        setViewedSession({
+          id: sessionId,
+          label: meta?.label || `Session ${sessionId}`,
+          createdAt: meta?.createdAt || null,
+          rawText: text,
+          finals,
+          insights,
+        });
+        // Make sure the page jumps back to the top so the user
+        // visually lands on the saved meeting, not partway through
+        // the live one they were just looking at.
+        if (typeof window !== "undefined") {
+          try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (_) {}
+        }
+      } catch (e) {
+        setViewedError(e.message || "Failed to load session");
+        setViewedSession(null);
+      } finally {
+        setViewedLoading(false);
+      }
+    },
+    [persistence.loadSession]
+  );
+
+  // Return to the live meeting. Live state was never touched, so
+  // this is just a state flip.
+  const handleBackToLive = useCallback(() => {
+    setViewedSession(null);
+    setViewedError("");
+  }, []);
+
+  // saveInsights wrapper that targets the *currently-rendered* session.
+  // In live mode that's the live session_id (handled by the hook's
+  // default). In saved-session view, the user is editing the saved
+  // meeting, so the write must target the saved session's id.
+  const saveInsightsForCurrentView = useCallback(
+    async (insightsObj) => {
+      const targetId = viewedSession?.id || null;
+      return persistence.saveInsights(insightsObj, targetId);
+    },
+    [persistence.saveInsights, viewedSession]
+  );
+
   const interim = micActive && micSocket.interim
     ? micSocket.interim
     : sysSocket.interim;
@@ -302,6 +387,29 @@ export default function App() {
     const sources = micActive ? "System Audio + Microphone" : "System Audio";
     return `${langLabel} (${provider} · ${sources})`;
   })();
+
+  // Are we currently rendering a saved meeting in the main page?
+  const isViewing = viewedSession !== null;
+
+  // What goes into the live transcript components.
+  // - In live mode  : real socket finals + interim partials.
+  // - In saved mode : parsed finals from the saved record + no interim.
+  const transcriptFinalsForPage = isViewing ? viewedSession.finals : mergedFinals;
+  const transcriptInterimForPage = isViewing ? "" : interim;
+  const insightsFinalsForPage = isViewing ? viewedSession.finals : mergedFinals;
+  const insightsInitial = isViewing ? viewedSession.insights : null;
+  // sessionId tells the panel which session to write to when the user
+  // hits Save. In saved mode that's the saved meeting; in live mode
+  // it's the live session_id from the persistence hook.
+  const insightsSessionId = isViewing
+    ? viewedSession.id
+    : persistence.sessionId;
+
+  // Saved-meeting subtitle replaces the live one when viewing a
+  // restored session, so the page still looks at-a-glance what it is.
+  const transcriptSubtitle = isViewing
+    ? `Saved Meeting · ${viewedSession.label}`
+    : panelSubtitle;
 
   return (
     <div
@@ -355,69 +463,138 @@ export default function App() {
       </header>
 
       <main className="flex-1 min-h-0 p-6 flex flex-col gap-4">
-        <label className="flex items-center gap-2 text-sm flex-wrap">
-          <span className="text-slate-300">Microphone</span>
-          <select
-            value={micDeviceId}
-            onChange={(e) => setMicDeviceId(e.target.value)}
-            className="bg-slate-800 border border-slate-600 rounded-md px-2 py-1 text-white max-w-xs truncate"
-            title="Used when the floating mic widget turns the mic on"
-          >
-            {micOptions.map((d) => (
-              <option key={d.id || "__default__"} value={d.id}>{d.label}</option>
-            ))}
-          </select>
-          <span className="text-xs text-slate-500">
-            (used when you turn the mic ON in the floating widget)
-          </span>
-        </label>
+        {/* Saved-meeting banner — visible only when the page is
+            rendering a session loaded from history. Behaves like the
+            user has navigated into "Open Meeting"; clicking the
+            button flips back to the live recording without restarting
+            anything. */}
+        {isViewing ? (
+          <div className="px-4 py-3 rounded-md bg-cyan-950/40 border border-cyan-700 text-cyan-100 flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-3">
+              <span className="text-base" aria-hidden="true">📂</span>
+              <div className="flex flex-col">
+                <span className="text-sm font-semibold">
+                  Viewing Saved Session
+                </span>
+                <span className="text-xs text-cyan-200/80">
+                  {viewedSession.label}
+                  {viewedSession.createdAt
+                    ? ` · ${new Date(viewedSession.createdAt).toLocaleString()}`
+                    : ""}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setHistoryOpen(true)}
+                className="px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200"
+              >
+                Open another
+              </button>
+              <button
+                type="button"
+                onClick={handleBackToLive}
+                className="px-3 py-1.5 rounded-md text-sm font-medium bg-cyan-600 hover:bg-cyan-500 text-white"
+              >
+                ← Back to Live Session
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {viewedLoading ? (
+          <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
+            Loading saved session…
+          </div>
+        ) : null}
+
+        {viewedError ? (
+          <div className="px-4 py-2 rounded-md bg-red-950/60 border border-red-800 text-red-200 text-sm">
+            {viewedError}
+          </div>
+        ) : null}
+
+        {/* Live-only controls. Hidden while viewing a saved session
+            so the user can't accidentally start a recording over the
+            top of what they're reading. The live pipelines keep
+            running in the background, ready for "Back to Live"; only
+            the chrome is hidden. */}
+        {!isViewing ? (
+          <label className="flex items-center gap-2 text-sm flex-wrap">
+            <span className="text-slate-300">Microphone</span>
+            <select
+              value={micDeviceId}
+              onChange={(e) => setMicDeviceId(e.target.value)}
+              className="bg-slate-800 border border-slate-600 rounded-md px-2 py-1 text-white max-w-xs truncate"
+              title="Used when the floating mic widget turns the mic on"
+            >
+              {micOptions.map((d) => (
+                <option key={d.id || "__default__"} value={d.id}>{d.label}</option>
+              ))}
+            </select>
+            <span className="text-xs text-slate-500">
+              (used when you turn the mic ON in the floating widget)
+            </span>
+          </label>
+        ) : null}
 
         <div className="flex items-center justify-between flex-wrap gap-3">
           <h2 className="text-lg font-medium text-slate-300">
-            Live Transcript{" "}
-            <span className="text-slate-500 text-sm font-normal">· {panelSubtitle}</span>
+            {isViewing ? "Transcript" : "Live Transcript"}{" "}
+            <span className="text-slate-500 text-sm font-normal">· {transcriptSubtitle}</span>
           </h2>
-          <div className="flex items-center gap-2 flex-wrap">
-            <button
-              type="button"
-              onClick={clearTranscripts}
-              disabled={mergedFinals.length === 0 && !interim}
-              className="px-3 py-2 rounded-md text-sm font-medium bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed transition-colors"
-            >
-              Clear
-            </button>
-            {translating ? (
+          {!isViewing ? (
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
-                onClick={handleStopTranslation}
-                className="px-4 py-2 rounded-md text-sm font-medium bg-red-600 hover:bg-red-500 transition-colors"
+                onClick={clearTranscripts}
+                disabled={mergedFinals.length === 0 && !interim}
+                className="px-3 py-2 rounded-md text-sm font-medium bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed transition-colors"
               >
-                Stop Translation
+                Clear
               </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handleStartTranslation}
-                disabled={!wsConnected}
-                className="px-4 py-2 rounded-md text-sm font-medium bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors"
-              >
-                Start Translation
-              </button>
-            )}
-            <FloatingMicWidget
-              micActive={micActive}
-              onMicToggle={handleToggleMic}
-              onClose={handleWidgetClose}
-              translationActive={translating}
-              wsConnected={wsConnected}
-              micError={audioError}
-            />
-          </div>
+              {translating ? (
+                <button
+                  type="button"
+                  onClick={handleStopTranslation}
+                  className="px-4 py-2 rounded-md text-sm font-medium bg-red-600 hover:bg-red-500 transition-colors"
+                >
+                  Stop Translation
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleStartTranslation}
+                  disabled={!wsConnected}
+                  className="px-4 py-2 rounded-md text-sm font-medium bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400 disabled:cursor-not-allowed transition-colors"
+                >
+                  Start Translation
+                </button>
+              )}
+              <FloatingMicWidget
+                micActive={micActive}
+                onMicToggle={handleToggleMic}
+                onClose={handleWidgetClose}
+                translationActive={translating}
+                wsConnected={wsConnected}
+                micError={audioError}
+              />
+            </div>
+          ) : null}
         </div>
 
-        {errorMessage ? (
+        {/* Live-only error banner. Persistence errors are shown in
+            both modes because they affect saved-mode "Save"
+            operations too. */}
+        {!isViewing && errorMessage ? (
           <div className="px-4 py-2 rounded-md bg-red-950/60 border border-red-800 text-red-200 text-sm">
             {errorMessage}
+          </div>
+        ) : null}
+        {isViewing && persistence.error ? (
+          <div className="px-4 py-2 rounded-md bg-red-950/60 border border-red-800 text-red-200 text-sm">
+            {persistence.error}
           </div>
         ) : null}
 
@@ -436,7 +613,8 @@ export default function App() {
           </div>
         ) : null}
 
-        {!translating ? (
+        {/* Live status hints — only meaningful while recording. */}
+        {!isViewing && !translating ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
             Click <span className="font-medium">Start Translation</span> and pick a
             tab (or "Entire Screen") in the share picker. Tick{" "}
@@ -446,28 +624,37 @@ export default function App() {
           </div>
         ) : null}
 
-        {translating && !isHindi && sessionStatus !== "ready" ? (
+        {!isViewing && translating && !isHindi && sessionStatus !== "ready" ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
             Connecting to AssemblyAI…
           </div>
         ) : null}
 
-        {translating && isHindi ? (
+        {!isViewing && translating && isHindi ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
             Captions appear about every {HINDI_CHUNK_MS / 1000} seconds (Whisper batches Hindi audio in chunks).
           </div>
         ) : null}
 
         <div className="flex-1 min-h-0">
-          <TranscriptPanel finals={mergedFinals} interim={interim} />
+          <TranscriptPanel
+            finals={transcriptFinalsForPage}
+            interim={transcriptInterimForPage}
+          />
         </div>
 
         <div className="mt-4">
+          {/* Same component, same code path. The `key` flips on
+              session switch so React fully remounts the panel and
+              `initialInsights` is honoured cleanly each time. */}
           <InsightsPanel
-            finals={mergedFinals}
-            sessionId={persistence.sessionId}
-            saveInsights={persistence.saveInsights}
+            key={isViewing ? `saved-${viewedSession.id}` : "live"}
+            finals={insightsFinalsForPage}
+            sessionId={insightsSessionId}
+            saveInsights={saveInsightsForCurrentView}
             persistenceEnabled={persistence.persistenceEnabled}
+            initialInsights={insightsInitial}
+            savedView={isViewing}
           />
         </div>
       </main>
@@ -476,8 +663,9 @@ export default function App() {
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
         listSessions={persistence.listSessions}
-        loadSession={persistence.loadSession}
+        onOpenSession={handleOpenSession}
         currentSessionId={persistence.sessionId}
+        viewedSessionId={viewedSession?.id || null}
       />
     </div>
   );
