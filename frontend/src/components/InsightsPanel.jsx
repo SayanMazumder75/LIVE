@@ -221,6 +221,127 @@ function SpeakerStatsBar({ stats }) {
   );
 }
 
+// ── reusable section block (used by both live + saved views) ─────────────
+//
+// Renders the full AI Meeting Intelligence stack — Summary, Key Points,
+// Action Items, Topics, Timeline, Flashcards, Quiz, Study Vault — for a
+// given `insights` object. Both `<InsightsPanel/>` (live generation)
+// and `<SessionHistory/>` (loading a saved meeting) call this so the
+// two views are guaranteed to look identical.
+//
+// Props
+// -----
+//   insights      : the AI Meeting Intelligence object (summary,
+//                   keyPoints, actionItems, topics, timeline,
+//                   flashcards, quiz, studyVault).
+//   vaultSection  : JSX rendered inside the Study Vault collapsible.
+//                   Live mode passes the Save button + status pill +
+//                   in-memory vault list. Saved mode passes a
+//                   read-only metadata block with savedAt and
+//                   lineCount.
+//
+// Order matters: this matches the spec's required order
+// (Summary → Key Points → Action Items → Topics → Timeline →
+// Flashcards → Quiz → Study Vault).
+export function MeetingIntelligenceSections({ insights, vaultSection }) {
+  if (!insights) return null;
+  return (
+    <div style={{ marginTop: 4 }}>
+      <Section icon={Brain} title="AI Summary" color="#a855f7" defaultOpen>
+        <p style={{ margin: 0, fontSize: 13, color: "#cbd5e1", lineHeight: 1.7 }}>
+          {insights.summary}
+        </p>
+      </Section>
+
+      <Section icon={ListChecks} title="Key Points" color="#3b82f6"
+        count={insights.keyPoints?.length}>
+        <ul style={{ margin: 0, padding: 0, listStyle: "none",
+          display: "flex", flexDirection: "column", gap: 2 }}>
+          {insights.keyPoints?.map((p, i) => (
+            <li key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start",
+              padding: "7px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+              <span style={{ color: "#3b82f6", fontSize: 10, marginTop: 5, flexShrink: 0 }}>◆</span>
+              <p style={{ margin: 0, fontSize: 13, color: "#cbd5e1", lineHeight: 1.6 }}>{p}</p>
+            </li>
+          ))}
+        </ul>
+      </Section>
+
+      <Section icon={CheckSquare} title="Action Items" color="#22c55e"
+        count={insights.actionItems?.length}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {insights.actionItems?.map((a, i) => (
+            <div key={i} style={{ background: "rgba(34,197,94,0.05)",
+              border: "1px solid rgba(34,197,94,0.15)", borderRadius: 8,
+              padding: "10px 12px" }}>
+              <div style={{ display: "flex", alignItems: "flex-start",
+                justifyContent: "space-between", gap: 8 }}>
+                <p style={{ margin: "0 0 4px", fontSize: 13, color: "#cbd5e1" }}>{a.task}</p>
+                <span style={{
+                  background: (priorityColor[a.priority] || "#94a3b8") + "22",
+                  color: priorityColor[a.priority] || "#94a3b8",
+                  border: `1px solid ${(priorityColor[a.priority] || "#94a3b8")}44`,
+                  borderRadius: 99, padding: "1px 8px", fontSize: 10,
+                  fontWeight: 700, flexShrink: 0,
+                }}>{a.priority}</span>
+              </div>
+              <span style={{ fontSize: 11, color: "#64748b" }}>👤 {a.owner}</span>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section icon={Sparkles} title="Topics Detected" color="#f59e0b"
+        count={insights.topics?.length}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {insights.topics?.map((t, i) => (
+            <span key={i} style={{ background: "rgba(245,158,11,0.1)",
+              border: "1px solid rgba(245,158,11,0.3)", borderRadius: 99,
+              padding: "4px 12px", fontSize: 12, color: "#fcd34d" }}>{t}</span>
+          ))}
+        </div>
+      </Section>
+
+      <Section icon={Brain} title="Meeting Timeline" color="#6366f1"
+        count={insights.timeline?.length}>
+        <div style={{ display: "flex", flexDirection: "column" }}>
+          {insights.timeline?.map((e, i) => (
+            <div key={i} style={{ display: "flex", gap: 12, paddingBottom: 14 }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                <div style={{ width: 8, height: 8, borderRadius: 99,
+                  background: "#6366f1", flexShrink: 0, marginTop: 3 }} />
+                {i < (insights.timeline.length - 1) && (
+                  <div style={{ width: 1, flex: 1, background: "rgba(99,102,241,0.2)",
+                    marginTop: 3 }} />
+                )}
+              </div>
+              <div>
+                <span style={{ fontSize: 10, color: "#6366f1", fontWeight: 700,
+                  display: "block", marginBottom: 2 }}>{e.time}</span>
+                <p style={{ margin: 0, fontSize: 12, color: "#94a3b8" }}>{e.event}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section icon={BookOpen} title="Flashcards" color="#f59e0b"
+        count={insights.flashcards?.length}>
+        <FlashcardDeck cards={insights.flashcards || []} />
+      </Section>
+
+      <Section icon={HelpCircle} title="Quiz" color="#ec4899"
+        count={insights.quiz?.length}>
+        {insights.quiz?.map((q, i) => <QuizCard key={i} q={q} idx={i} />)}
+      </Section>
+
+      <Section icon={Archive} title="Study Vault" color="#06b6d4">
+        {vaultSection}
+      </Section>
+    </div>
+  );
+}
+
 // ── main component ────────────────────────────────────────────────────────
 export default function InsightsPanel({
   finals,
@@ -350,6 +471,105 @@ Quiz: options array has exactly 4 items, answer must match one option exactly.`;
     display: "flex", alignItems: "center", gap: 6,
   };
 
+  // ── live-mode Study Vault contents ─────────────────────────────────────
+  // Save button + persist-status pill + the in-memory vault list that
+  // shows previous "Save Current Insights" clicks during this session.
+  const liveVaultSection = (
+    <>
+      <div style={{ marginBottom: 12, display: "flex",
+        alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <button
+          onClick={saveToVault}
+          disabled={saved || persistStatus === "saving"}
+          style={{
+            ...btnBase,
+            background: saved ? "rgba(6,182,212,0.15)" : "rgba(6,182,212,0.2)",
+            color: saved ? "#67e8f9" : "#22d3ee",
+            border: "1px solid rgba(6,182,212,0.3)",
+            padding: "7px 14px",
+            opacity: saved ? 0.7 : 1,
+          }}
+        >
+          {persistStatus === "saving"
+            ? <><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
+            : saved
+              ? <><Check size={13} /> Saved to Vault</>
+              : <><Archive size={13} /> Save Current Insights</>}
+        </button>
+
+        {persistStatus === "saved" && (
+          <span style={{ fontSize: 11, color: "#4ade80",
+            background: "rgba(74,222,128,0.1)",
+            border: "1px solid rgba(74,222,128,0.3)",
+            borderRadius: 99, padding: "2px 10px" }}>
+            ● Stored in session
+          </span>
+        )}
+        {persistStatus === "no-session" && (
+          <span style={{ fontSize: 11, color: "#fcd34d",
+            background: "rgba(245,158,11,0.1)",
+            border: "1px solid rgba(245,158,11,0.3)",
+            borderRadius: 99, padding: "2px 10px" }}
+            title={persistMessage}>
+            ⚠ No active session — click Start Translation first
+          </span>
+        )}
+        {persistStatus === "disabled" && (
+          <span style={{ fontSize: 11, color: "#fcd34d",
+            background: "rgba(245,158,11,0.1)",
+            border: "1px solid rgba(245,158,11,0.3)",
+            borderRadius: 99, padding: "2px 10px" }}
+            title={persistMessage}>
+            ⚠ MongoDB persistence disabled
+          </span>
+        )}
+        {persistStatus === "error" && (
+          <span style={{ fontSize: 11, color: "#fca5a5",
+            background: "rgba(239,68,68,0.1)",
+            border: "1px solid rgba(239,68,68,0.3)",
+            borderRadius: 99, padding: "2px 10px" }}
+            title={persistMessage}>
+            ✗ Save failed
+          </span>
+        )}
+      </div>
+
+      {!sessionId && persistenceEnabled !== false && (
+        <p style={{ margin: "0 0 10px", fontSize: 11, color: "#64748b" }}>
+          Tip: insights save into the existing session document — start
+          a translation first so there's a session to attach to.
+        </p>
+      )}
+      {vault.length === 0 && (
+        <p style={{ margin: 0, fontSize: 12, color: "#475569" }}>
+          No saved sessions yet.
+        </p>
+      )}
+      {vault.map((v) => (
+        <div key={v.id} style={{ background: "rgba(6,182,212,0.05)",
+          border: "1px solid rgba(6,182,212,0.15)", borderRadius: 10,
+          padding: "12px 14px", marginBottom: 8 }}>
+          <div style={{ display: "flex", justifyContent: "space-between",
+            marginBottom: 6 }}>
+            <span style={{ fontSize: 11, color: "#64748b" }}>{v.savedAt}</span>
+            <span style={{ fontSize: 11, color: "#64748b" }}>{v.lineCount} lines</span>
+          </div>
+          <p style={{ margin: "0 0 8px", fontSize: 12, color: "#94a3b8" }}>{v.summary}</p>
+          <details>
+            <summary style={{ fontSize: 11, color: "#06b6d4", cursor: "pointer" }}>
+              {v.keyPoints?.length} key points · {v.actionItems?.length} actions · {v.flashcards?.length} flashcards
+            </summary>
+            <ul style={{ margin: "8px 0 0", padding: "0 0 0 16px" }}>
+              {v.keyPoints?.map((p, i) => (
+                <li key={i} style={{ fontSize: 11, color: "#64748b", marginBottom: 3 }}>{p}</li>
+              ))}
+            </ul>
+          </details>
+        </div>
+      ))}
+    </>
+  );
+
   return (
     <div style={{
       background: "rgba(15,23,42,0.95)",
@@ -414,196 +634,10 @@ Quiz: options array has exactly 4 items, answer must match one option exactly.`;
       )}
 
       {/* ── sections (collapsible, same as old code) ── */}
-      {insights && (
-        <div style={{ marginTop: 4 }}>
-
-          <Section icon={Brain} title="AI Summary" color="#a855f7" defaultOpen>
-            <p style={{ margin: 0, fontSize: 13, color: "#cbd5e1", lineHeight: 1.7 }}>
-              {insights.summary}
-            </p>
-          </Section>
-
-          <Section icon={ListChecks} title="Key Points" color="#3b82f6"
-            count={insights.keyPoints?.length}>
-            <ul style={{ margin: 0, padding: 0, listStyle: "none",
-              display: "flex", flexDirection: "column", gap: 2 }}>
-              {insights.keyPoints?.map((p, i) => (
-                <li key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start",
-                  padding: "7px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
-                  <span style={{ color: "#3b82f6", fontSize: 10, marginTop: 5, flexShrink: 0 }}>◆</span>
-                  <p style={{ margin: 0, fontSize: 13, color: "#cbd5e1", lineHeight: 1.6 }}>{p}</p>
-                </li>
-              ))}
-            </ul>
-          </Section>
-
-          <Section icon={CheckSquare} title="Action Items" color="#22c55e"
-            count={insights.actionItems?.length}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {insights.actionItems?.map((a, i) => (
-                <div key={i} style={{ background: "rgba(34,197,94,0.05)",
-                  border: "1px solid rgba(34,197,94,0.15)", borderRadius: 8,
-                  padding: "10px 12px" }}>
-                  <div style={{ display: "flex", alignItems: "flex-start",
-                    justifyContent: "space-between", gap: 8 }}>
-                    <p style={{ margin: "0 0 4px", fontSize: 13, color: "#cbd5e1" }}>{a.task}</p>
-                    <span style={{
-                      background: (priorityColor[a.priority] || "#94a3b8") + "22",
-                      color: priorityColor[a.priority] || "#94a3b8",
-                      border: `1px solid ${(priorityColor[a.priority] || "#94a3b8")}44`,
-                      borderRadius: 99, padding: "1px 8px", fontSize: 10,
-                      fontWeight: 700, flexShrink: 0,
-                    }}>{a.priority}</span>
-                  </div>
-                  <span style={{ fontSize: 11, color: "#64748b" }}>👤 {a.owner}</span>
-                </div>
-              ))}
-            </div>
-          </Section>
-
-          <Section icon={Sparkles} title="Topics Detected" color="#f59e0b"
-            count={insights.topics?.length}>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              {insights.topics?.map((t, i) => (
-                <span key={i} style={{ background: "rgba(245,158,11,0.1)",
-                  border: "1px solid rgba(245,158,11,0.3)", borderRadius: 99,
-                  padding: "4px 12px", fontSize: 12, color: "#fcd34d" }}>{t}</span>
-              ))}
-            </div>
-          </Section>
-
-          <Section icon={Brain} title="Meeting Timeline" color="#6366f1"
-            count={insights.timeline?.length}>
-            <div style={{ display: "flex", flexDirection: "column" }}>
-              {insights.timeline?.map((e, i) => (
-                <div key={i} style={{ display: "flex", gap: 12, paddingBottom: 14 }}>
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                    <div style={{ width: 8, height: 8, borderRadius: 99,
-                      background: "#6366f1", flexShrink: 0, marginTop: 3 }} />
-                    {i < (insights.timeline.length - 1) && (
-                      <div style={{ width: 1, flex: 1, background: "rgba(99,102,241,0.2)",
-                        marginTop: 3 }} />
-                    )}
-                  </div>
-                  <div>
-                    <span style={{ fontSize: 10, color: "#6366f1", fontWeight: 700,
-                      display: "block", marginBottom: 2 }}>{e.time}</span>
-                    <p style={{ margin: 0, fontSize: 12, color: "#94a3b8" }}>{e.event}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </Section>
-
-          <Section icon={BookOpen} title="Flashcards" color="#f59e0b"
-            count={insights.flashcards?.length}>
-            <FlashcardDeck cards={insights.flashcards || []} />
-          </Section>
-
-          <Section icon={HelpCircle} title="Quiz" color="#ec4899"
-            count={insights.quiz?.length}>
-            {insights.quiz?.map((q, i) => <QuizCard key={i} q={q} idx={i} />)}
-          </Section>
-
-          {/* Study Vault (from old code) */}
-          <Section icon={Archive} title="Study Vault" color="#06b6d4">
-            <div style={{ marginBottom: 12, display: "flex",
-              alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <button
-                onClick={saveToVault}
-                disabled={saved || persistStatus === "saving"}
-                style={{
-                  ...btnBase,
-                  background: saved ? "rgba(6,182,212,0.15)" : "rgba(6,182,212,0.2)",
-                  color: saved ? "#67e8f9" : "#22d3ee",
-                  border: "1px solid rgba(6,182,212,0.3)",
-                  padding: "7px 14px",
-                  opacity: saved ? 0.7 : 1,
-                }}
-              >
-                {persistStatus === "saving"
-                  ? <><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
-                  : saved
-                    ? <><Check size={13} /> Saved to Vault</>
-                    : <><Archive size={13} /> Save Current Insights</>}
-              </button>
-
-              {/* Status pill: confirms whether the click actually
-                  reached MongoDB and updated session.insights. */}
-              {persistStatus === "saved" && (
-                <span style={{ fontSize: 11, color: "#4ade80",
-                  background: "rgba(74,222,128,0.1)",
-                  border: "1px solid rgba(74,222,128,0.3)",
-                  borderRadius: 99, padding: "2px 10px" }}>
-                  ● Stored in session
-                </span>
-              )}
-              {persistStatus === "no-session" && (
-                <span style={{ fontSize: 11, color: "#fcd34d",
-                  background: "rgba(245,158,11,0.1)",
-                  border: "1px solid rgba(245,158,11,0.3)",
-                  borderRadius: 99, padding: "2px 10px" }}
-                  title={persistMessage}>
-                  ⚠ No active session — click Start Translation first
-                </span>
-              )}
-              {persistStatus === "disabled" && (
-                <span style={{ fontSize: 11, color: "#fcd34d",
-                  background: "rgba(245,158,11,0.1)",
-                  border: "1px solid rgba(245,158,11,0.3)",
-                  borderRadius: 99, padding: "2px 10px" }}
-                  title={persistMessage}>
-                  ⚠ MongoDB persistence disabled
-                </span>
-              )}
-              {persistStatus === "error" && (
-                <span style={{ fontSize: 11, color: "#fca5a5",
-                  background: "rgba(239,68,68,0.1)",
-                  border: "1px solid rgba(239,68,68,0.3)",
-                  borderRadius: 99, padding: "2px 10px" }}
-                  title={persistMessage}>
-                  ✗ Save failed
-                </span>
-              )}
-            </div>
-            {/* Helper hint when there's no session_id yet, before the
-                user even clicks save. */}
-            {!sessionId && persistenceEnabled !== false && (
-              <p style={{ margin: "0 0 10px", fontSize: 11, color: "#64748b" }}>
-                Tip: insights save into the existing session document — start
-                a translation first so there's a session to attach to.
-              </p>
-            )}
-            {vault.length === 0 && (
-              <p style={{ margin: 0, fontSize: 12, color: "#475569" }}>
-                No saved sessions yet.
-              </p>
-            )}
-            {vault.map((v) => (
-              <div key={v.id} style={{ background: "rgba(6,182,212,0.05)",
-                border: "1px solid rgba(6,182,212,0.15)", borderRadius: 10,
-                padding: "12px 14px", marginBottom: 8 }}>
-                <div style={{ display: "flex", justifyContent: "space-between",
-                  marginBottom: 6 }}>
-                  <span style={{ fontSize: 11, color: "#64748b" }}>{v.savedAt}</span>
-                  <span style={{ fontSize: 11, color: "#64748b" }}>{v.lineCount} lines</span>
-                </div>
-                <p style={{ margin: "0 0 8px", fontSize: 12, color: "#94a3b8" }}>{v.summary}</p>
-                <details>
-                  <summary style={{ fontSize: 11, color: "#06b6d4", cursor: "pointer" }}>
-                    {v.keyPoints?.length} key points · {v.actionItems?.length} actions · {v.flashcards?.length} flashcards
-                  </summary>
-                  <ul style={{ margin: "8px 0 0", padding: "0 0 0 16px" }}>
-                    {v.keyPoints?.map((p, i) => (
-                      <li key={i} style={{ fontSize: 11, color: "#64748b", marginBottom: 3 }}>{p}</li>
-                    ))}
-                  </ul>
-                </details>
-              </div>
-            ))}
-          </Section>
-        </div>
-      )}
+      <MeetingIntelligenceSections
+        insights={insights}
+        vaultSection={liveVaultSection}
+      />
 
       {/* spinner keyframes */}
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>

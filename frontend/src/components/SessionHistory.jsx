@@ -1,26 +1,34 @@
 import { useCallback, useEffect, useState } from "react";
+import { Brain, Archive } from "lucide-react";
+import { MeetingIntelligenceSections } from "./InsightsPanel.jsx";
 
 /**
  * SessionHistory
  * --------------
- * A drawer that lists past saved sessions (from `GET /transcripts`)
- * and lets the user load any of them into a read-only viewer
- * (`GET /transcript/:session_id`).
+ * Drawer that lists past saved sessions (`GET /transcripts`) and, when
+ * one is clicked, renders the **complete saved meeting** — transcript
+ * plus every AI Meeting Intelligence section (Summary, Key Points,
+ * Action Items, Topics, Timeline, Flashcards, Quiz, Study Vault) —
+ * using the exact same React components the live `<InsightsPanel/>`
+ * uses during generation.
  *
- * This component intentionally does NOT touch the live transcript
- * panel, the audio pipelines, or the WebSocket flow. It only reads
- * from the session-storage API. Loading a previous session opens its
- * text in a separate viewer area inside the drawer; the live
- * captioning UI keeps running underneath, exactly as before.
+ * Reopening a saved session feels like reopening the meeting, not
+ * opening a transcript file. The sidebar (left column) is unchanged;
+ * only the right-hand viewer swaps from a transcript-only `<pre>` to
+ * a full meeting view when the loaded session has saved insights.
+ *
+ * Loading flow:
+ *   click row -> loadSession(id) -> {text, insights?}
+ *               -> render Transcript + (if insights) full intelligence stack
  *
  * Props
  * -----
- *   open        : boolean — drawer visibility
- *   onClose     : () => void — close handler
- *   listSessions: () => Promise<Array<{id,label,createdAt}>>
- *   loadSession : (id: string) => Promise<string|null>  // returns saved text
- *   currentSessionId : string | null — id of the in-progress session,
- *                                       highlighted in the list
+ *   open              : drawer visibility
+ *   onClose           : close handler
+ *   listSessions      : () => Promise<[{id,label,createdAt}]>
+ *   loadSession       : (id) => Promise<string | {text, insights} | null>
+ *   currentSessionId  : id of the in-progress session, highlighted in
+ *                       the list
  */
 export default function SessionHistory({
   open,
@@ -65,9 +73,13 @@ export default function SessionHistory({
       setViewerError("");
       setViewerLoading(true);
       try {
-        // loadSession now returns either a string (legacy callers
-        // that ask for just the transcript) or an object
-        // {text, insights} — single query, full meeting.
+        // loadSession returns either a string (transcript-only legacy
+        // sessions) or an object {text, insights} when AI Meeting
+        // Intelligence was previously saved on the same record. The
+        // backend ships both in a single GET /transcript/:id response,
+        // so the "Load Session → Load Transcript → Load Saved AI
+        // Intelligence → Render Complete Meeting View" flow is one
+        // request, not three.
         const result = await loadSession(sid);
         if (result === null) {
           setViewerError(
@@ -77,9 +89,9 @@ export default function SessionHistory({
           setViewerText(result || "(this session has no saved transcript yet)");
         } else {
           setViewerText(
-            (result.text && result.text.length > 0
+            result.text && result.text.length > 0
               ? result.text
-              : "(this session has no saved transcript yet)")
+              : "(this session has no saved transcript yet)"
           );
           if (result.insights && typeof result.insights === "object") {
             setViewerInsights(result.insights);
@@ -117,7 +129,7 @@ export default function SessionHistory({
           top: 0,
           right: 0,
           bottom: 0,
-          width: "min(720px, 92vw)",
+          width: "min(960px, 96vw)",
           background: "#0f172a",
           borderLeft: "1px solid #334155",
           boxShadow: "-12px 0 32px rgba(0,0,0,0.5)",
@@ -194,7 +206,7 @@ export default function SessionHistory({
             gap: 0,
           }}
         >
-          {/* List pane */}
+          {/* List pane (sidebar — unchanged per the spec) */}
           <div
             style={{
               borderRight: "1px solid #334155",
@@ -291,7 +303,7 @@ export default function SessionHistory({
             </ul>
           </div>
 
-          {/* Viewer pane */}
+          {/* Viewer pane — full meeting view */}
           <div
             style={{
               overflowY: "auto",
@@ -302,7 +314,10 @@ export default function SessionHistory({
           >
             {!selectedId ? (
               <p style={{ color: "#64748b", margin: 0 }}>
-                Select a session on the left to view its saved transcript.
+                Select a session on the left to reopen the complete meeting:
+                transcript, summary, key points, action items, topics,
+                timeline, flashcards, quiz, and study vault — exactly as it
+                looked when it was generated.
               </p>
             ) : viewerLoading ? (
               <p style={{ color: "#94a3b8", margin: 0 }}>Loading…</p>
@@ -319,31 +334,11 @@ export default function SessionHistory({
                 {viewerError}
               </div>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    fontFamily:
-                      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                    fontSize: 12,
-                    color: "#e2e8f0",
-                    background: "#0b1220",
-                    border: "1px solid #1e293b",
-                    borderRadius: 8,
-                    padding: "12px 14px",
-                  }}
-                >
-                  {viewerText}
-                </pre>
-                {/* Saved AI Meeting Intelligence comes back in the
-                    same response as `text`, because everything lives
-                    on the same session document by design. */}
-                {viewerInsights ? (
-                  <SavedInsightsView insights={viewerInsights} />
-                ) : null}
-              </div>
+              <SavedMeetingView
+                sessionId={selectedId}
+                transcriptText={viewerText}
+                insights={viewerInsights}
+              />
             )}
           </div>
         </div>
@@ -353,165 +348,166 @@ export default function SessionHistory({
 }
 
 /**
- * SavedInsightsView
- * -----------------
- * Read-only renderer for the AI Meeting Intelligence subtree that
- * lives on the same session document as the transcript. Mirrors the
- * sections in the live InsightsPanel (summary, key points, action
- * items, topics, timeline, flashcards, quiz, study vault) but in a
- * compact "review what was saved" form rather than the interactive
- * generation UI. No regeneration here — that's the job of the live
- * panel.
+ * SavedMeetingView
+ * ----------------
+ * Renders a full saved meeting in the order required by the spec:
+ *
+ *   Transcript
+ *     ↓
+ *   AI Meeting Intelligence (header)
+ *     ↓ Summary ↓ Key Points ↓ Action Items ↓ Topics
+ *     ↓ Timeline ↓ Flashcards ↓ Quiz ↓ Study Vault
+ *
+ * The intelligence stack is rendered through the *same*
+ * `<MeetingIntelligenceSections/>` component that the live
+ * `<InsightsPanel/>` uses, so a re-opened meeting looks identical to
+ * a freshly-generated one. The Study Vault section is given a
+ * read-only metadata block (savedAt + lineCount) instead of a Save
+ * button — the meeting is already saved.
  */
-function SavedInsightsView({ insights }) {
-  if (!insights || typeof insights !== "object") return null;
-
-  const sections = [
-    ["Summary", insights.summary, "string"],
-    ["Key Points", insights.keyPoints, "list"],
-    ["Action Items", insights.actionItems, "actions"],
-    ["Topics", insights.topics, "tags"],
-    ["Timeline", insights.timeline, "timeline"],
-    ["Flashcards", insights.flashcards, "flashcards"],
-    ["Quiz", insights.quiz, "quiz"],
-  ];
-
+function SavedMeetingView({ sessionId, transcriptText, insights }) {
   return (
-    <div
-      style={{
-        background: "rgba(139,92,246,0.06)",
-        border: "1px solid rgba(139,92,246,0.25)",
-        borderRadius: 8,
-        padding: "12px 14px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 12,
-      }}
-    >
-      <div style={{ fontSize: 11, fontWeight: 700, color: "#a78bfa",
-        letterSpacing: "0.1em", textTransform: "uppercase" }}>
-        Saved AI Intelligence
-        {insights.studyVault?.savedAt ? (
-          <span style={{ marginLeft: 8, color: "#64748b", fontWeight: 500 }}>
-            · {new Date(insights.studyVault.savedAt).toLocaleString()}
-            {insights.studyVault.lineCount != null
-              ? ` · ${insights.studyVault.lineCount} lines`
-              : ""}
-          </span>
-        ) : null}
-      </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* ── Transcript ───────────────────────────────────────────────── */}
+      <section>
+        <h3
+          style={{
+            margin: "0 0 8px",
+            fontSize: 13,
+            fontWeight: 700,
+            color: "#cbd5e1",
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Transcript
+        </h3>
+        <pre
+          style={{
+            margin: 0,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            fontFamily:
+              "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+            fontSize: 12,
+            color: "#e2e8f0",
+            background: "#0b1220",
+            border: "1px solid #1e293b",
+            borderRadius: 8,
+            padding: "12px 14px",
+          }}
+        >
+          {transcriptText}
+        </pre>
+      </section>
 
-      {sections.map(([title, value, kind]) => {
-        if (value == null) return null;
-        if (Array.isArray(value) && value.length === 0) return null;
-        if (typeof value === "string" && !value.trim()) return null;
-        return (
-          <div key={title}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: "#cbd5e1",
-              marginBottom: 6 }}>{title}</div>
-            <SavedSectionBody value={value} kind={kind} />
+      {/* ── AI Meeting Intelligence ──────────────────────────────────── */}
+      {insights ? (
+        <section
+          style={{
+            background: "rgba(15,23,42,0.95)",
+            border: "1px solid rgba(139,92,246,0.25)",
+            borderRadius: 16,
+            padding: "20px 22px",
+            backdropFilter: "blur(12px)",
+            fontFamily: "ui-sans-serif, system-ui, sans-serif",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              marginBottom: 18,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+              <Brain size={20} style={{ color: "#a855f7" }} />
+              <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#f1f5f9" }}>
+                AI Meeting Intelligence
+              </h2>
+              <span style={{ fontSize: 11, color: "#64748b", marginLeft: 4 }}>
+                Saved meeting · session {sessionId}
+              </span>
+            </div>
           </div>
-        );
-      })}
+
+          <MeetingIntelligenceSections
+            insights={insights}
+            vaultSection={<SavedVaultMetadata insights={insights} />}
+          />
+        </section>
+      ) : (
+        <p
+          style={{
+            margin: 0,
+            fontSize: 12,
+            color: "#64748b",
+            background: "rgba(139,92,246,0.05)",
+            border: "1px dashed rgba(139,92,246,0.25)",
+            borderRadius: 8,
+            padding: "10px 12px",
+          }}
+        >
+          No AI Meeting Intelligence has been saved for this session yet.
+          Open the live transcript, generate insights, then click{" "}
+          <strong>Save Current Insights</strong> to attach them to this session.
+        </p>
+      )}
     </div>
   );
 }
 
-function SavedSectionBody({ value, kind }) {
-  if (kind === "string") {
-    return <p style={{ margin: 0, fontSize: 12, color: "#94a3b8",
-      lineHeight: 1.6 }}>{value}</p>;
-  }
-  if (kind === "list") {
-    return (
-      <ul style={{ margin: 0, paddingLeft: 18 }}>
-        {value.map((p, i) => (
-          <li key={i} style={{ fontSize: 12, color: "#94a3b8", marginBottom: 3 }}>{p}</li>
-        ))}
-      </ul>
-    );
-  }
-  if (kind === "tags") {
-    return (
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-        {value.map((t, i) => (
-          <span key={i} style={{ background: "rgba(245,158,11,0.1)",
-            border: "1px solid rgba(245,158,11,0.3)", borderRadius: 99,
-            padding: "2px 10px", fontSize: 11, color: "#fcd34d" }}>{t}</span>
-        ))}
+/**
+ * Read-only Study Vault contents for a saved meeting.
+ * Replaces the live "Save Current Insights" button with the metadata
+ * recorded at save time, so the user sees *when* this meeting was
+ * archived without being offered to re-save it.
+ */
+function SavedVaultMetadata({ insights }) {
+  const sv = insights && typeof insights.studyVault === "object" ? insights.studyVault : null;
+  const savedAt = sv?.savedAt ? new Date(sv.savedAt) : null;
+  const savedLabel =
+    savedAt && !Number.isNaN(savedAt.getTime())
+      ? savedAt.toLocaleString()
+      : null;
+  return (
+    <div
+      style={{
+        background: "rgba(6,182,212,0.05)",
+        border: "1px solid rgba(6,182,212,0.15)",
+        borderRadius: 10,
+        padding: "12px 14px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <Archive size={14} style={{ color: "#22d3ee" }} />
+        <span style={{ fontSize: 12, fontWeight: 700, color: "#67e8f9" }}>
+          Saved meeting
+        </span>
       </div>
-    );
-  }
-  if (kind === "actions") {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {value.map((a, i) => (
-          <div key={i} style={{ background: "rgba(34,197,94,0.05)",
-            border: "1px solid rgba(34,197,94,0.15)", borderRadius: 6,
-            padding: "8px 10px", fontSize: 12, color: "#cbd5e1" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-              <span>{a.task}</span>
-              <span style={{ fontSize: 10, color: "#64748b" }}>{a.priority}</span>
-            </div>
-            {a.owner ? (
-              <div style={{ fontSize: 10, color: "#64748b" }}>👤 {a.owner}</div>
-            ) : null}
-          </div>
-        ))}
+      <div style={{ fontSize: 11, color: "#94a3b8" }}>
+        {savedLabel ? <>Archived {savedLabel}</> : "Archived"}
+        {sv?.lineCount != null ? (
+          <> · {sv.lineCount} transcript line{sv.lineCount === 1 ? "" : "s"}</>
+        ) : null}
       </div>
-    );
-  }
-  if (kind === "timeline") {
-    return (
-      <ol style={{ margin: 0, paddingLeft: 18 }}>
-        {value.map((e, i) => (
-          <li key={i} style={{ fontSize: 12, color: "#94a3b8", marginBottom: 4 }}>
-            <span style={{ color: "#6366f1", fontWeight: 700 }}>{e.time}</span>
-            {e.event ? <span> — {e.event}</span> : null}
-          </li>
-        ))}
-      </ol>
-    );
-  }
-  if (kind === "flashcards") {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {value.map((c, i) => (
-          <div key={i} style={{ background: "rgba(245,158,11,0.05)",
-            border: "1px solid rgba(245,158,11,0.2)", borderRadius: 6,
-            padding: "8px 10px", fontSize: 12, color: "#cbd5e1" }}>
-            <div style={{ fontWeight: 600, color: "#fcd34d" }}>{c.front}</div>
-            <div style={{ color: "#94a3b8", marginTop: 2 }}>{c.back}</div>
-          </div>
-        ))}
-      </div>
-    );
-  }
-  if (kind === "quiz") {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {value.map((q, i) => (
-          <div key={i} style={{ background: "rgba(236,72,153,0.05)",
-            border: "1px solid rgba(236,72,153,0.2)", borderRadius: 6,
-            padding: "8px 10px", fontSize: 12, color: "#cbd5e1" }}>
-            <div style={{ fontWeight: 600, color: "#f9a8d4" }}>
-              Q{i + 1}. {q.question}
-            </div>
-            {Array.isArray(q.options) ? (
-              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
-                {q.options.map((o, j) => (
-                  <li key={j} style={{ fontSize: 11,
-                    color: o === q.answer ? "#4ade80" : "#94a3b8" }}>
-                    {String.fromCharCode(65 + j)}. {o}
-                    {o === q.answer ? "  ✓" : ""}
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
-        ))}
-      </div>
-    );
-  }
-  return null;
+      <p
+        style={{
+          margin: "4px 0 0",
+          fontSize: 11,
+          color: "#475569",
+          lineHeight: 1.5,
+        }}
+      >
+        This meeting is already saved in the session document — the same
+        record that holds the transcript above. To capture changes, regenerate
+        and save from the live transcript view.
+      </p>
+    </div>
+  );
 }
