@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import TranscriptPanel from "./components/TranscriptPanel.jsx";
 import FloatingMicWidget from "./components/FloatingMicWidget.jsx";
+import SessionHistory from "./components/SessionHistory.jsx";
 import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
 import { useMixedAudio } from "./hooks/useMixedAudio.js";
+import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
+// Session persistence (MongoDB) — same shape as the old MeetMind
+// project's HTTP API. Override with VITE_HTTP_URL when the backend
+// HTTP server runs on a different host/port from localhost:8000.
+const HTTP_URL = import.meta.env.VITE_HTTP_URL || "http://localhost:8000";
 
 const HINDI_CHUNK_MS = 4000;
 const HINDI_MIN_BYTES = 16000 * 2 * 0.3;
@@ -36,6 +42,15 @@ export default function App() {
 
   const sysSocket = useTranscriptSocket(WS_URL);
   const micSocket = useTranscriptSocket(WS_URL);
+
+  // ── Session persistence (MongoDB, ported from MeetMind server.js) ────
+  // Lifecycle: startSession() runs on Start Translation; every new
+  // finalized line in `mergedFinals` is pushed via /push; the
+  // SessionHistory drawer lists past sessions and loads them on demand.
+  // Persistence is best-effort — failures don't interrupt the live
+  // pipeline.
+  const persistence = useSessionPersistence(HTTP_URL);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const langRef = useRef(language);
   useEffect(() => { langRef.current = language; }, [language]);
@@ -140,6 +155,10 @@ export default function App() {
   // ── start / stop translation ──────────────────────────────────────────
   const handleStartTranslation = useCallback(async () => {
     if (!wsConnected) return;
+    // Create a new MongoDB session (best-effort — silently no-ops when
+    // the backend has no MONGO_URI). Mirrors the old project's
+    // POST /start-session at the start of every recording.
+    persistence.startSession();
     if (language === "en") {
       sysSocket.startSession();
     }
@@ -147,7 +166,7 @@ export default function App() {
     if (!ok && language === "en") {
       sysSocket.stopSession();
     }
-  }, [wsConnected, language, sysSocket.startSession, startSystem, sysSocket.stopSession]);
+  }, [wsConnected, language, sysSocket.startSession, startSystem, sysSocket.stopSession, persistence.startSession]);
 
   const handleStopTranslation = useCallback(async () => {
     await stopSystem();
@@ -239,6 +258,18 @@ export default function App() {
     );
   }, [sysSocket.finals, micSocket.finals]);
 
+  // ── persist finalized lines to MongoDB ────────────────────────────────
+  // Mirrors the old project's per-flush `Session.findOneAndUpdate`
+  // append. The hook itself dedupes by id + translation-id, so this
+  // effect can run on every render of mergedFinals without producing
+  // duplicate /push calls. Interim transcripts are NOT in
+  // `mergedFinals` (the WebSocket layer keeps those in `interim` only),
+  // so this naturally stores finalized lines only — same invariant as
+  // the old project's flushBuffer.
+  useEffect(() => {
+    persistence.flushFinals(mergedFinals);
+  }, [mergedFinals, persistence.flushFinals]);
+
   const interim = micActive && micSocket.interim
     ? micSocket.interim
     : sysSocket.interim;
@@ -246,10 +277,15 @@ export default function App() {
   const clearTranscripts = useCallback(() => {
     sysSocket.clearTranscripts();
     micSocket.clearTranscripts();
-  }, [sysSocket.clearTranscripts, micSocket.clearTranscripts]);
+    // Detach from the in-progress MongoDB session so future finals
+    // start a fresh push-id ledger; the saved session record itself
+    // remains in MongoDB (visible in the History drawer).
+    persistence.resetSession();
+  }, [sysSocket.clearTranscripts, micSocket.clearTranscripts, persistence.resetSession]);
 
   const sessionStatus = sysSocket.sessionStatus;
-  const errorMessage = sysSocket.error || micSocket.error || audioError;
+  const errorMessage =
+    sysSocket.error || micSocket.error || audioError || persistence.error;
 
   const micOptions = (() => {
     const items = micDevices.map((d, i) => ({
@@ -300,6 +336,21 @@ export default function App() {
               </span>
             </span>
           </div>
+          <button
+            type="button"
+            onClick={() => setHistoryOpen(true)}
+            title={
+              persistence.persistenceEnabled
+                ? "Browse saved sessions"
+                : "Backend has no MONGO_URI — sessions are not being saved"
+            }
+            className="px-3 py-1.5 rounded-md text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 transition-colors"
+          >
+            History
+            {persistence.sessionId ? (
+              <span className="ml-1.5 text-xs text-emerald-400">●</span>
+            ) : null}
+          </button>
         </div>
       </header>
 
@@ -400,6 +451,14 @@ export default function App() {
           <InsightsPanel finals={mergedFinals} />
         </div>
       </main>
+
+      <SessionHistory
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        listSessions={persistence.listSessions}
+        loadSession={persistence.loadSession}
+        currentSessionId={persistence.sessionId}
+      />
     </div>
   );
 }

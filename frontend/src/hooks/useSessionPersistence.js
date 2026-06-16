@@ -1,0 +1,261 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+/**
+ * useSessionPersistence
+ * ---------------------
+ * Thin client for the four session-storage routes ported from the old
+ * MeetMind project's `server.js`:
+ *
+ *     POST /start-session            — create a new session, return id
+ *     POST /push                     — append a finalized line of text
+ *     GET  /transcripts              — list saved sessions (newest first)
+ *     GET  /transcript/:session_id   — load one saved session's text
+ *
+ * The app uses this hook from `App.jsx` to:
+ *   1. start a session when the user clicks Start Translation,
+ *   2. push every finalized transcript line to /push as it lands,
+ *   3. list / load past sessions in the SessionHistory sidebar.
+ *
+ * Persistence is **best-effort**. Network errors are logged and
+ * surfaced via `error` state but never throw — the live translation
+ * pipeline keeps working regardless. This matches the old project's
+ * behaviour, where a Mongo write failure also just logged and moved
+ * on without interrupting the UI.
+ *
+ * The same pushed-id set is used for the original line and (if it
+ * arrives later) the translation line, so each transcript turn ends up
+ * stored at most twice — once for the source-language final, and once
+ * for the translation. That's how the live UI renders Hindi-mode lines
+ * (Hindi text + English under it), and the saved transcript reads the
+ * same way.
+ *
+ * @param {string} httpUrl  Base URL of the session API. Defaults to
+ *                          `http://localhost:8000`. Override with
+ *                          `VITE_HTTP_URL` for non-default deploys.
+ */
+export function useSessionPersistence(httpUrl) {
+  const baseUrl = (httpUrl || "http://localhost:8000").replace(/\/+$/, "");
+
+  const [sessionId, setSessionId] = useState(null);
+  const [persistenceEnabled, setPersistenceEnabled] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Stable ref so push callbacks always read the *current* session_id
+  // without being recreated by React.
+  const sessionIdRef = useRef(null);
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  // Track which lines we've already pushed. Keys are either
+  //   `${id}`              — for the source-language final
+  // or
+  //   `${id}:translation`  — for the (later) translation.
+  // A Set ref instead of state because we mutate it from inside an
+  // effect and don't want to re-render on every push.
+  const pushedRef = useRef(new Set());
+
+  // ── helpers ────────────────────────────────────────────────────────────
+
+  const _post = useCallback(
+    async (path, body) => {
+      const url = `${baseUrl}${path}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      if (res.status === 503) {
+        // Backend says persistence is disabled (no MONGO_URI). Don't
+        // hammer it with retries — flip the flag so the rest of the
+        // app stops trying to push.
+        setPersistenceEnabled(false);
+        return null;
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`${path} ${res.status} ${text}`);
+      }
+      return res.json();
+    },
+    [baseUrl]
+  );
+
+  const _get = useCallback(
+    async (path) => {
+      const url = `${baseUrl}${path}`;
+      const res = await fetch(url);
+      if (res.status === 503) {
+        setPersistenceEnabled(false);
+        return null;
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`${path} ${res.status} ${text}`);
+      }
+      return res.json();
+    },
+    [baseUrl]
+  );
+
+  // ── start a session ────────────────────────────────────────────────────
+
+  const startSession = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await _post("/start-session", {});
+      if (!data || !data.session_id) {
+        // 503 / disabled — clear any previous id so we don't push to
+        // a stale one.
+        setSessionId(null);
+        pushedRef.current = new Set();
+        return null;
+      }
+      setSessionId(data.session_id);
+      // Fresh session = fresh pushed-id ledger.
+      pushedRef.current = new Set();
+      return data.session_id;
+    } catch (e) {
+      console.warn("[session] start-session failed:", e);
+      setError(`Could not start session: ${e.message}`);
+      return null;
+    }
+  }, [_post]);
+
+  // ── push one line ──────────────────────────────────────────────────────
+
+  const pushLine = useCallback(
+    async (line) => {
+      const id = sessionIdRef.current;
+      if (!id || !persistenceEnabled) return false;
+      if (!line || typeof line !== "string") return false;
+      try {
+        const data = await _post("/push", { session_id: id, text: line });
+        if (data === null) return false; // disabled mid-flight
+        return Boolean(data && data.ok);
+      } catch (e) {
+        // Don't disable persistence on a single transient push error;
+        // log it and keep the live pipeline running.
+        console.warn("[session] push failed:", e);
+        setError(`Push failed: ${e.message}`);
+        return false;
+      }
+    },
+    [_post, persistenceEnabled]
+  );
+
+  // ── push a batch of finalized lines, deduped by id ─────────────────────
+
+  /**
+   * Walk through `finals` (in order) and push any line we haven't
+   * already pushed. Used by App.jsx in a useEffect that watches
+   * `mergedFinals`.
+   *
+   * Each `final` is `{id, text, translation, source, createdAt}`. We
+   * push:
+   *   - `[SOURCE] [HH:MM:SS] text`               on first sight
+   *   - `[SOURCE] [HH:MM:SS] -> translation`     when translation arrives
+   *
+   * Same dedup key shape used by the pushedRef set (`id` and
+   * `${id}:translation`).
+   */
+  const flushFinals = useCallback(
+    async (finals) => {
+      if (!sessionIdRef.current || !persistenceEnabled) return;
+      if (!Array.isArray(finals) || finals.length === 0) return;
+      const pushed = pushedRef.current;
+
+      // Build the pending list synchronously, mark as pushed *before*
+      // awaiting, so re-entry of this function (next finals update)
+      // doesn't queue a duplicate request for the same line. If the
+      // network call later fails, we accept the loss — better that
+      // than a flood of duplicates that the live UI never had.
+      const pending = [];
+      for (const line of finals) {
+        if (!line || !line.id) continue;
+        const source = (line.source === "mic" ? "MIC" : "SYSTEM");
+        const stamp = formatTimestamp(line.createdAt);
+
+        if (line.text && !pushed.has(line.id)) {
+          pushed.add(line.id);
+          pending.push(`[${source}] [${stamp}] ${line.text}`);
+        }
+
+        if (line.translation) {
+          const tKey = `${line.id}:translation`;
+          if (!pushed.has(tKey)) {
+            pushed.add(tKey);
+            pending.push(`[${source}] [${stamp}] → ${line.translation}`);
+          }
+        }
+      }
+
+      // Push sequentially so the saved order matches the on-screen
+      // order even if /push latencies jitter.
+      for (const text of pending) {
+        await pushLine(text);
+      }
+    },
+    [pushLine, persistenceEnabled]
+  );
+
+  // ── session history ────────────────────────────────────────────────────
+
+  const listSessions = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await _get("/transcripts");
+      if (data === null) return [];
+      return Array.isArray(data) ? data : [];
+    } catch (e) {
+      console.warn("[session] list /transcripts failed:", e);
+      setError(`Could not list sessions: ${e.message}`);
+      return [];
+    }
+  }, [_get]);
+
+  const loadSession = useCallback(
+    async (sid) => {
+      if (!sid) return null;
+      setError(null);
+      try {
+        const data = await _get(`/transcript/${encodeURIComponent(sid)}`);
+        if (data === null) return null;
+        return typeof data.text === "string" ? data.text : "";
+      } catch (e) {
+        console.warn("[session] load /transcript failed:", e);
+        setError(`Could not load session: ${e.message}`);
+        return null;
+      }
+    },
+    [_get]
+  );
+
+  // ── reset (used when user clears transcripts client-side) ──────────────
+
+  const resetSession = useCallback(() => {
+    setSessionId(null);
+    pushedRef.current = new Set();
+  }, []);
+
+  return {
+    sessionId,
+    persistenceEnabled,
+    error,
+    startSession,
+    pushLine,
+    flushFinals,
+    listSessions,
+    loadSession,
+    resetSession,
+  };
+}
+
+/** Format a Date / ms timestamp as HH:MM:SS — matches old server.js. */
+function formatTimestamp(input) {
+  const d = input ? new Date(input) : new Date();
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
