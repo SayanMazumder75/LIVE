@@ -78,11 +78,21 @@ def _503_if_no_db() -> web.Response | None:
     """Return a friendly 503 when MongoDB isn't configured."""
     if db.is_enabled():
         return None
-    return _json_error(
-        503,
-        "Session persistence is disabled. Set MONGO_URI in backend/.env "
-        "and restart the server to enable /start-session, /push, "
-        "/transcripts, and /transcript/:session_id.",
+    err = db.connection_error()
+    if err:
+        # Real connection attempt failed — include the classified
+        # error so the frontend banner can tell the user exactly what
+        # to fix (auth, IP allowlist, malformed URI, etc.).
+        message = f"Session persistence is disabled. {err}"
+    else:
+        message = (
+            "Session persistence is disabled. Set MONGO_URI in backend/.env "
+            "and restart the server to enable /start-session, /push, "
+            "/transcripts, and /transcript/:session_id."
+        )
+    return web.json_response(
+        {"error": message, "diagnostics": db.diagnostics()},
+        status=503,
     )
 
 
@@ -274,6 +284,7 @@ async def get_root(_request: web.Request) -> web.Response:
             "status": "ok",
             "service": "AI Transcriber session API",
             "persistence": "enabled" if db.is_enabled() else "disabled",
+            "diagnostics": db.diagnostics(),
         }
     )
 

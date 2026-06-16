@@ -53,10 +53,81 @@ _client: Any = None  # motor.motor_asyncio.AsyncIOMotorClient | None
 _db: Any = None  # motor.motor_asyncio.AsyncIOMotorDatabase | None
 _sessions: Any = None  # collection handle
 
+# Last connect attempt diagnostics — surfaced to the browser via the
+# 503 responses and `GET /` so users can see *why* persistence is off
+# without having to scrape backend logs.
+_last_error: str = ""
+_uri_was_set: bool = False
+_db_name: str = ""
+
 
 def is_enabled() -> bool:
     """True when start_db() successfully connected."""
     return _sessions is not None
+
+
+def connection_error() -> str:
+    """Return the last MongoDB connection error message, or ''."""
+    return _last_error
+
+
+def diagnostics() -> dict:
+    """
+    Snapshot of the persistence layer's current state, safe to expose
+    over HTTP. The URI itself is never returned — only whether it was
+    set and the database name we ended up using.
+    """
+    return {
+        "enabled": is_enabled(),
+        "mongo_uri_set": _uri_was_set,
+        "mongo_db": _db_name,
+        "error": _last_error,
+    }
+
+
+def _classify_error(exc: Exception) -> str:
+    """
+    Turn motor / pymongo exceptions into a single human-friendly line
+    that points at the most likely fix. We pattern-match on the
+    exception text because importing pymongo error classes here would
+    create a hard dependency just for the message — pymongo is already
+    pulled in by motor but we still want this module importable
+    without it.
+    """
+    msg = str(exc) or exc.__class__.__name__
+    low = msg.lower()
+    name = exc.__class__.__name__
+
+    if "authentication failed" in low or "auth failed" in low or "bad auth" in low:
+        return (
+            "Authentication failed. Check the username/password in MONGO_URI. "
+            "If the password contains '@', ':', '/', '#' or '+', percent-encode "
+            "them (e.g. '@' -> '%40'). Original: " + msg
+        )
+    if "ip" in low and ("not allowed" in low or "whitelist" in low or "allowlist" in low):
+        return (
+            "MongoDB Atlas rejected this IP. In the Atlas dashboard go to "
+            "Network Access and add your current IP (or 0.0.0.0/0 for testing). "
+            "Original: " + msg
+        )
+    if name == "ServerSelectionTimeoutError" or "server selection timeout" in low:
+        return (
+            "Could not reach the MongoDB server within 5s. Likely causes: (1) "
+            "Atlas IP allowlist is blocking this machine, (2) the cluster is "
+            "paused, (3) DNS / network. Original: " + msg
+        )
+    if "configurationerror" in name.lower() or "invalid uri" in low or "must include" in low:
+        return (
+            "MONGO_URI is malformed. Expected something like "
+            "'mongodb+srv://USER:PASS@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority'. "
+            "Original: " + msg
+        )
+    if "name or service not known" in low or "nodename" in low or "getaddrinfo" in low:
+        return (
+            "DNS lookup for the MongoDB host failed. Check the cluster hostname "
+            "in MONGO_URI. Original: " + msg
+        )
+    return msg
 
 
 async def start_db() -> None:
@@ -69,10 +140,12 @@ async def start_db() -> None:
     simply disabled — every route that needs it returns 503 with a
     clear message, but the WebSocket transcription path keeps working.
     """
-    global _client, _db, _sessions
+    global _client, _db, _sessions, _last_error, _uri_was_set, _db_name
 
     uri = os.getenv("MONGO_URI", "").strip()
+    _uri_was_set = bool(uri)
     if not uri:
+        _last_error = "MONGO_URI is not set in backend/.env"
         logger.warning(
             "MONGO_URI is not set; session persistence is disabled. Set "
             "MONGO_URI in backend/.env to enable /start-session, /push, "
@@ -80,18 +153,26 @@ async def start_db() -> None:
         )
         return
 
+    # Log a redacted form of the URI so the user can confirm dotenv
+    # loaded the value they expect *without* leaking credentials.
+    logger.info("MONGO_URI loaded: %s", _redact_uri(uri))
+
     try:
         # Imported lazily so a missing motor install only breaks the
         # persistence layer, not the WebSocket server.
         from motor.motor_asyncio import AsyncIOMotorClient
     except ImportError:
+        _last_error = (
+            "`motor` is not installed. Run `pip install motor` "
+            "(or `pip install -r backend/requirements.txt`) and restart."
+        )
         logger.warning(
             "MONGO_URI is set but `motor` is not installed — session "
             "persistence is disabled. Run `pip install motor`."
         )
         return
 
-    db_name = os.getenv("MONGO_DB", "").strip() or None
+    db_name_env = os.getenv("MONGO_DB", "").strip() or None
 
     try:
         client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
@@ -100,11 +181,12 @@ async def start_db() -> None:
         # the same thing).
         await client.admin.command("ping")
     except Exception as e:  # noqa: BLE001
-        logger.error("MongoDB error: %s", e)
+        _last_error = _classify_error(e)
+        logger.error("MongoDB error: %s", _last_error)
         return
 
-    if db_name:
-        db = client[db_name]
+    if db_name_env:
+        db = client[db_name_env]
     else:
         # If the URI embeds a default database use it; otherwise fall
         # back to "meetmind" so old-project records remain accessible
@@ -127,7 +209,25 @@ async def start_db() -> None:
     _client = client
     _db = db
     _sessions = sessions
+    _db_name = db.name
+    _last_error = ""
     logger.info("MongoDB connected (db=%s, collection=sessions)", db.name)
+
+
+def _redact_uri(uri: str) -> str:
+    """Hide the password in a Mongo connection string for safe logging."""
+    try:
+        # mongodb+srv://USER:PASS@host/db?... -> mongodb+srv://USER:***@host/db?...
+        scheme, rest = uri.split("://", 1)
+        if "@" in rest:
+            creds, hostpart = rest.split("@", 1)
+            if ":" in creds:
+                user, _ = creds.split(":", 1)
+                return f"{scheme}://{user}:***@{hostpart}"
+            return f"{scheme}://{creds}@{hostpart}"
+        return uri
+    except Exception:  # noqa: BLE001
+        return "<unparseable URI>"
 
 
 async def close_db() -> None:

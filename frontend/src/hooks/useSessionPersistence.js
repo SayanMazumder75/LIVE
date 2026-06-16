@@ -39,6 +39,10 @@ export function useSessionPersistence(httpUrl) {
   const [sessionId, setSessionId] = useState(null);
   const [persistenceEnabled, setPersistenceEnabled] = useState(true);
   const [error, setError] = useState(null);
+  // Backend-supplied reason persistence is off (auth failure, IP
+  // allowlist, malformed URI, etc.) — surfaced via a UI banner so the
+  // user can fix .env without scraping backend logs.
+  const [persistenceReason, setPersistenceReason] = useState("");
 
   // Stable ref so push callbacks always read the *current* session_id
   // without being recreated by React.
@@ -66,10 +70,19 @@ export function useSessionPersistence(httpUrl) {
         body: JSON.stringify(body || {}),
       });
       if (res.status === 503) {
-        // Backend says persistence is disabled (no MONGO_URI). Don't
-        // hammer it with retries — flip the flag so the rest of the
-        // app stops trying to push.
+        // Backend says persistence is disabled. Try to capture the
+        // classified reason ('Authentication failed', 'IP not allowed',
+        // 'MONGO_URI is malformed', ...) so the UI can tell the user
+        // exactly what to fix in backend/.env.
+        let reason = "";
+        try {
+          const data = await res.json();
+          reason = (data && (data.error || (data.diagnostics && data.diagnostics.error))) || "";
+        } catch (_e) {
+          /* ignore */
+        }
         setPersistenceEnabled(false);
+        setPersistenceReason(reason || "Session persistence is disabled on the backend.");
         return null;
       }
       if (!res.ok) {
@@ -86,7 +99,15 @@ export function useSessionPersistence(httpUrl) {
       const url = `${baseUrl}${path}`;
       const res = await fetch(url);
       if (res.status === 503) {
+        let reason = "";
+        try {
+          const data = await res.json();
+          reason = (data && (data.error || (data.diagnostics && data.diagnostics.error))) || "";
+        } catch (_e) {
+          /* ignore */
+        }
         setPersistenceEnabled(false);
+        setPersistenceReason(reason || "Session persistence is disabled on the backend.");
         return null;
       }
       if (!res.ok) {
@@ -97,6 +118,45 @@ export function useSessionPersistence(httpUrl) {
     },
     [baseUrl]
   );
+
+  // ── probe persistence state on mount ──────────────────────────────────
+  // Hits the backend's `GET /` once so the UI can show the right
+  // banner *before* the user tries to start a session. Without this,
+  // the user would only learn persistence is broken after their first
+  // /start-session 503.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${baseUrl}/`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const enabled = data && data.persistence === "enabled";
+        setPersistenceEnabled(enabled);
+        if (!enabled) {
+          const reason =
+            (data && data.diagnostics && data.diagnostics.error) ||
+            "Session persistence is disabled on the backend.";
+          setPersistenceReason(reason);
+        } else {
+          setPersistenceReason("");
+        }
+      } catch (e) {
+        // Backend HTTP server isn't reachable — we'll fall back to
+        // the 503 path on first user action.
+        if (!cancelled) {
+          setPersistenceEnabled(false);
+          setPersistenceReason(
+            `Could not reach session API at ${baseUrl}. Is the backend running?`
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [baseUrl]);
 
   // ── start a session ────────────────────────────────────────────────────
 
@@ -241,6 +301,7 @@ export function useSessionPersistence(httpUrl) {
   return {
     sessionId,
     persistenceEnabled,
+    persistenceReason,
     error,
     startSession,
     pushLine,
