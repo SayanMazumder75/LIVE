@@ -35,6 +35,7 @@ export default function SessionHistory({
 
   const [selectedId, setSelectedId] = useState(null);
   const [viewerText, setViewerText] = useState("");
+  const [viewerInsights, setViewerInsights] = useState(null);
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState("");
 
@@ -60,16 +61,29 @@ export default function SessionHistory({
     async (sid) => {
       setSelectedId(sid);
       setViewerText("");
+      setViewerInsights(null);
       setViewerError("");
       setViewerLoading(true);
       try {
-        const text = await loadSession(sid);
-        if (text === null) {
+        // loadSession now returns either a string (legacy callers
+        // that ask for just the transcript) or an object
+        // {text, insights} — single query, full meeting.
+        const result = await loadSession(sid);
+        if (result === null) {
           setViewerError(
             "Could not load this session. The backend may not be configured for persistence."
           );
+        } else if (typeof result === "string") {
+          setViewerText(result || "(this session has no saved transcript yet)");
         } else {
-          setViewerText(text || "(this session has no saved transcript yet)");
+          setViewerText(
+            (result.text && result.text.length > 0
+              ? result.text
+              : "(this session has no saved transcript yet)")
+          );
+          if (result.insights && typeof result.insights === "object") {
+            setViewerInsights(result.insights);
+          }
         }
       } catch (e) {
         setViewerError(e.message || "Failed to load session");
@@ -305,27 +319,199 @@ export default function SessionHistory({
                 {viewerError}
               </div>
             ) : (
-              <pre
-                style={{
-                  margin: 0,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                  fontFamily:
-                    "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                  fontSize: 12,
-                  color: "#e2e8f0",
-                  background: "#0b1220",
-                  border: "1px solid #1e293b",
-                  borderRadius: 8,
-                  padding: "12px 14px",
-                }}
-              >
-                {viewerText}
-              </pre>
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                <pre
+                  style={{
+                    margin: 0,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    fontFamily:
+                      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                    fontSize: 12,
+                    color: "#e2e8f0",
+                    background: "#0b1220",
+                    border: "1px solid #1e293b",
+                    borderRadius: 8,
+                    padding: "12px 14px",
+                  }}
+                >
+                  {viewerText}
+                </pre>
+                {/* Saved AI Meeting Intelligence comes back in the
+                    same response as `text`, because everything lives
+                    on the same session document by design. */}
+                {viewerInsights ? (
+                  <SavedInsightsView insights={viewerInsights} />
+                ) : null}
+              </div>
             )}
           </div>
         </div>
       </aside>
     </>
   );
+}
+
+/**
+ * SavedInsightsView
+ * -----------------
+ * Read-only renderer for the AI Meeting Intelligence subtree that
+ * lives on the same session document as the transcript. Mirrors the
+ * sections in the live InsightsPanel (summary, key points, action
+ * items, topics, timeline, flashcards, quiz, study vault) but in a
+ * compact "review what was saved" form rather than the interactive
+ * generation UI. No regeneration here — that's the job of the live
+ * panel.
+ */
+function SavedInsightsView({ insights }) {
+  if (!insights || typeof insights !== "object") return null;
+
+  const sections = [
+    ["Summary", insights.summary, "string"],
+    ["Key Points", insights.keyPoints, "list"],
+    ["Action Items", insights.actionItems, "actions"],
+    ["Topics", insights.topics, "tags"],
+    ["Timeline", insights.timeline, "timeline"],
+    ["Flashcards", insights.flashcards, "flashcards"],
+    ["Quiz", insights.quiz, "quiz"],
+  ];
+
+  return (
+    <div
+      style={{
+        background: "rgba(139,92,246,0.06)",
+        border: "1px solid rgba(139,92,246,0.25)",
+        borderRadius: 8,
+        padding: "12px 14px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 12,
+      }}
+    >
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#a78bfa",
+        letterSpacing: "0.1em", textTransform: "uppercase" }}>
+        Saved AI Intelligence
+        {insights.studyVault?.savedAt ? (
+          <span style={{ marginLeft: 8, color: "#64748b", fontWeight: 500 }}>
+            · {new Date(insights.studyVault.savedAt).toLocaleString()}
+            {insights.studyVault.lineCount != null
+              ? ` · ${insights.studyVault.lineCount} lines`
+              : ""}
+          </span>
+        ) : null}
+      </div>
+
+      {sections.map(([title, value, kind]) => {
+        if (value == null) return null;
+        if (Array.isArray(value) && value.length === 0) return null;
+        if (typeof value === "string" && !value.trim()) return null;
+        return (
+          <div key={title}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#cbd5e1",
+              marginBottom: 6 }}>{title}</div>
+            <SavedSectionBody value={value} kind={kind} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SavedSectionBody({ value, kind }) {
+  if (kind === "string") {
+    return <p style={{ margin: 0, fontSize: 12, color: "#94a3b8",
+      lineHeight: 1.6 }}>{value}</p>;
+  }
+  if (kind === "list") {
+    return (
+      <ul style={{ margin: 0, paddingLeft: 18 }}>
+        {value.map((p, i) => (
+          <li key={i} style={{ fontSize: 12, color: "#94a3b8", marginBottom: 3 }}>{p}</li>
+        ))}
+      </ul>
+    );
+  }
+  if (kind === "tags") {
+    return (
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {value.map((t, i) => (
+          <span key={i} style={{ background: "rgba(245,158,11,0.1)",
+            border: "1px solid rgba(245,158,11,0.3)", borderRadius: 99,
+            padding: "2px 10px", fontSize: 11, color: "#fcd34d" }}>{t}</span>
+        ))}
+      </div>
+    );
+  }
+  if (kind === "actions") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {value.map((a, i) => (
+          <div key={i} style={{ background: "rgba(34,197,94,0.05)",
+            border: "1px solid rgba(34,197,94,0.15)", borderRadius: 6,
+            padding: "8px 10px", fontSize: 12, color: "#cbd5e1" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <span>{a.task}</span>
+              <span style={{ fontSize: 10, color: "#64748b" }}>{a.priority}</span>
+            </div>
+            {a.owner ? (
+              <div style={{ fontSize: 10, color: "#64748b" }}>👤 {a.owner}</div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (kind === "timeline") {
+    return (
+      <ol style={{ margin: 0, paddingLeft: 18 }}>
+        {value.map((e, i) => (
+          <li key={i} style={{ fontSize: 12, color: "#94a3b8", marginBottom: 4 }}>
+            <span style={{ color: "#6366f1", fontWeight: 700 }}>{e.time}</span>
+            {e.event ? <span> — {e.event}</span> : null}
+          </li>
+        ))}
+      </ol>
+    );
+  }
+  if (kind === "flashcards") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {value.map((c, i) => (
+          <div key={i} style={{ background: "rgba(245,158,11,0.05)",
+            border: "1px solid rgba(245,158,11,0.2)", borderRadius: 6,
+            padding: "8px 10px", fontSize: 12, color: "#cbd5e1" }}>
+            <div style={{ fontWeight: 600, color: "#fcd34d" }}>{c.front}</div>
+            <div style={{ color: "#94a3b8", marginTop: 2 }}>{c.back}</div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (kind === "quiz") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {value.map((q, i) => (
+          <div key={i} style={{ background: "rgba(236,72,153,0.05)",
+            border: "1px solid rgba(236,72,153,0.2)", borderRadius: 6,
+            padding: "8px 10px", fontSize: 12, color: "#cbd5e1" }}>
+            <div style={{ fontWeight: 600, color: "#f9a8d4" }}>
+              Q{i + 1}. {q.question}
+            </div>
+            {Array.isArray(q.options) ? (
+              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                {q.options.map((o, j) => (
+                  <li key={j} style={{ fontSize: 11,
+                    color: o === q.answer ? "#4ade80" : "#94a3b8" }}>
+                    {String.fromCharCode(65 + j)}. {o}
+                    {o === q.answer ? "  ✓" : ""}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return null;
 }

@@ -295,6 +295,11 @@ def _serialize_session(doc: dict) -> dict:
     user_id = doc.get("userId")
     if user_id:
         out["userId"] = user_id
+    # AI Meeting Intelligence lives on the same document — see
+    # save_insights() below. Only include the field if it's been set,
+    # so old session records (transcript-only) still serialize cleanly.
+    if "insights" in doc and doc["insights"] is not None:
+        out["insights"] = doc["insights"]
     return out
 
 
@@ -420,3 +425,45 @@ async def get_transcript(session_id: str) -> Optional[str]:
     if not doc:
         return None
     return doc.get("text", "") or ""
+
+
+async def save_insights(session_id: str, insights: dict) -> bool:
+    """
+    Persist AI Meeting Intelligence into the EXISTING session document.
+
+    Per the project requirement, all generated intelligence (summary,
+    keyPoints, actionItems, topics, timeline, flashcards, quiz, and
+    the studyVault metadata) lives on the same record as the
+    transcript — there is intentionally no separate `vault`,
+    `meeting_intelligence`, `quiz`, or `flashcards` collection. A
+    single session document holds the entire meeting.
+
+    Implementation: one atomic `$set` of the whole `insights` subtree
+    so a re-save (e.g. user regenerated and clicked Save again)
+    cleanly overwrites the previous snapshot rather than merging
+    stale fields with new ones.
+
+    Returns True when the session existed and was updated, False when
+    no document with that session_id was found (so the HTTP layer can
+    map it to a 404 — same shape as POST /push).
+    """
+    sessions = _require_sessions()
+    result = await sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {"insights": insights}},
+    )
+    return result.matched_count > 0
+
+
+async def get_session_full(session_id: str) -> Optional[dict]:
+    """
+    Load the entire session document (transcript text + insights) so a
+    single query returns everything the client needs to rehydrate a
+    saved meeting. Returns None when no document with that session_id
+    exists.
+    """
+    sessions = _require_sessions()
+    doc = await sessions.find_one({"session_id": session_id})
+    if not doc:
+        return None
+    return _serialize_session(doc)

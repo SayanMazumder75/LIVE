@@ -222,12 +222,24 @@ function SpeakerStatsBar({ stats }) {
 }
 
 // ── main component ────────────────────────────────────────────────────────
-export default function InsightsPanel({ finals }) {
+export default function InsightsPanel({
+  finals,
+  sessionId,
+  saveInsights,
+  persistenceEnabled,
+}) {
   const [insights, setInsights] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [vault, setVault] = useState([]);
   const [saved, setSaved] = useState(false);
+  // Status of the most recent persist-to-MongoDB attempt. Drives the
+  // small status pill next to the "Save Current Insights" button so
+  // the user knows whether their click actually wrote to the session
+  // record (vs. only the local in-memory vault).
+  //   "" | "saving" | "saved" | "no-session" | "disabled" | "error"
+  const [persistStatus, setPersistStatus] = useState("");
+  const [persistMessage, setPersistMessage] = useState("");
 
   const stats = speakerStats(finals);
 
@@ -282,15 +294,54 @@ Quiz: options array has exactly 4 items, answer must match one option exactly.`;
     }
   }, [finals]);
 
-  const saveToVault = () => {
+  const saveToVault = async () => {
     if (!insights) return;
-    setVault((prev) => [{
-      id: Date.now(),
-      savedAt: new Date().toLocaleString(),
+    // 1. Build the snapshot. `studyVault` is metadata about THIS save
+    //    so the saved session document records when intelligence was
+    //    promoted from "generated" to "saved" and against how many
+    //    transcript lines. Living on the same `insights` subtree means
+    //    a single GET /transcript/:session_id returns it alongside
+    //    every other section.
+    const studyVault = {
+      savedAt: new Date().toISOString(),
       lineCount: finals.length,
-      ...insights,
-    }, ...prev]);
+    };
+    const fullInsights = { ...insights, studyVault };
+
+    // 2. Update the local vault list immediately so the UI reflects
+    //    the click without waiting for the network round-trip. Same
+    //    UX as before — only the persistence step is new.
+    setVault((prev) => [
+      {
+        id: Date.now(),
+        savedAt: new Date(studyVault.savedAt).toLocaleString(),
+        lineCount: studyVault.lineCount,
+        ...insights,
+      },
+      ...prev,
+    ]);
     setSaved(true);
+
+    // 3. Persist to MongoDB. Per the project requirement, this writes
+    //    to the EXISTING session document — no separate vault /
+    //    meeting_intelligence / quiz / flashcards collection. The
+    //    backend does an atomic `$set: { insights: ... }` on the same
+    //    record that already holds the transcript text.
+    if (!saveInsights) {
+      // No hook wired in — the panel is being rendered standalone
+      // (e.g. in tests). Local-only save is the legacy behaviour.
+      return;
+    }
+    setPersistStatus("saving");
+    setPersistMessage("");
+    const result = await saveInsights(fullInsights);
+    if (result?.ok) {
+      setPersistStatus("saved");
+      setPersistMessage(`Saved to session ${result.sessionId}`);
+    } else {
+      setPersistStatus(result?.reason || "error");
+      setPersistMessage(result?.message || "Failed to save to MongoDB");
+    }
   };
 
   const btnBase = {
@@ -456,10 +507,11 @@ Quiz: options array has exactly 4 items, answer must match one option exactly.`;
 
           {/* Study Vault (from old code) */}
           <Section icon={Archive} title="Study Vault" color="#06b6d4">
-            <div style={{ marginBottom: 12 }}>
+            <div style={{ marginBottom: 12, display: "flex",
+              alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <button
                 onClick={saveToVault}
-                disabled={saved}
+                disabled={saved || persistStatus === "saving"}
                 style={{
                   ...btnBase,
                   background: saved ? "rgba(6,182,212,0.15)" : "rgba(6,182,212,0.2)",
@@ -469,11 +521,59 @@ Quiz: options array has exactly 4 items, answer must match one option exactly.`;
                   opacity: saved ? 0.7 : 1,
                 }}
               >
-                {saved
-                  ? <><Check size={13} /> Saved to Vault</>
-                  : <><Archive size={13} /> Save Current Insights</>}
+                {persistStatus === "saving"
+                  ? <><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
+                  : saved
+                    ? <><Check size={13} /> Saved to Vault</>
+                    : <><Archive size={13} /> Save Current Insights</>}
               </button>
+
+              {/* Status pill: confirms whether the click actually
+                  reached MongoDB and updated session.insights. */}
+              {persistStatus === "saved" && (
+                <span style={{ fontSize: 11, color: "#4ade80",
+                  background: "rgba(74,222,128,0.1)",
+                  border: "1px solid rgba(74,222,128,0.3)",
+                  borderRadius: 99, padding: "2px 10px" }}>
+                  ● Stored in session
+                </span>
+              )}
+              {persistStatus === "no-session" && (
+                <span style={{ fontSize: 11, color: "#fcd34d",
+                  background: "rgba(245,158,11,0.1)",
+                  border: "1px solid rgba(245,158,11,0.3)",
+                  borderRadius: 99, padding: "2px 10px" }}
+                  title={persistMessage}>
+                  ⚠ No active session — click Start Translation first
+                </span>
+              )}
+              {persistStatus === "disabled" && (
+                <span style={{ fontSize: 11, color: "#fcd34d",
+                  background: "rgba(245,158,11,0.1)",
+                  border: "1px solid rgba(245,158,11,0.3)",
+                  borderRadius: 99, padding: "2px 10px" }}
+                  title={persistMessage}>
+                  ⚠ MongoDB persistence disabled
+                </span>
+              )}
+              {persistStatus === "error" && (
+                <span style={{ fontSize: 11, color: "#fca5a5",
+                  background: "rgba(239,68,68,0.1)",
+                  border: "1px solid rgba(239,68,68,0.3)",
+                  borderRadius: 99, padding: "2px 10px" }}
+                  title={persistMessage}>
+                  ✗ Save failed
+                </span>
+              )}
             </div>
+            {/* Helper hint when there's no session_id yet, before the
+                user even clicks save. */}
+            {!sessionId && persistenceEnabled !== false && (
+              <p style={{ margin: "0 0 10px", fontSize: 11, color: "#64748b" }}>
+                Tip: insights save into the existing session document — start
+                a translation first so there's a session to attach to.
+              </p>
+            )}
             {vault.length === 0 && (
               <p style={{ margin: 0, fontSize: 12, color: "#475569" }}>
                 No saved sessions yet.

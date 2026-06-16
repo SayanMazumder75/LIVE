@@ -245,10 +245,15 @@ async def get_transcript(request: web.Request) -> web.Response:
     """
     GET /transcript/{session_id}
 
-    Returns the saved transcript text:
-        { "text": "..." }
+    Returns the saved transcript AND any AI Meeting Intelligence that
+    has been saved on the same document:
 
-    Mirrors the old:
+        { "text": "...", "insights": {...} }   # insights omitted if not saved
+
+    All meeting data (transcript + summary + key points + action items
+    + topics + timeline + flashcards + quiz + studyVault) lives on the
+    same session record by design — one query rehydrates the whole
+    meeting. Mirrors the old project's:
         const session = await Session.findOne({ session_id, ... });
         if (!session) return 403;
         res.json({ text: session.text });
@@ -265,16 +270,77 @@ async def get_transcript(request: web.Request) -> web.Response:
         return _json_error(400, "session_id required")
 
     try:
-        text = await db.get_transcript(session_id)
+        full = await db.get_session_full(session_id)
     except db.MongoNotConfigured as e:
         return _json_error(503, str(e))
     except Exception as e:  # noqa: BLE001
         logger.exception("transcript fetch failed")
         return _json_error(500, str(e))
 
-    if text is None:
+    if full is None:
         return _json_error(404, "session not found")
-    return web.json_response({"text": text})
+
+    response: dict = {"text": full.get("text", "") or ""}
+    if "insights" in full and full["insights"] is not None:
+        response["insights"] = full["insights"]
+    return web.json_response(response)
+
+
+async def post_insights(request: web.Request) -> web.Response:
+    """
+    POST /insights
+
+    Body: {"session_id": "...", "insights": { ...full intelligence object... }}
+
+    Persists AI Meeting Intelligence into the EXISTING session
+    document. Per the project requirement, there is intentionally NO
+    separate vault / meeting_intelligence / quiz / flashcards
+    collection — everything lives on the session record so a single
+    GET /transcript/:session_id returns the whole meeting.
+
+    Expected `insights` shape (from InsightsPanel + studyVault metadata):
+        {
+          summary: str,
+          keyPoints: [str],
+          actionItems: [{task, owner, priority}],
+          topics: [str],
+          timeline: [{time, event}],
+          flashcards: [{front, back}],
+          quiz: [{question, options, answer}],
+          studyVault: {savedAt, lineCount}
+        }
+
+    The endpoint does not validate the inner shape — InsightsPanel
+    owns that contract — so future fields can be added without
+    touching the backend. Each save replaces the previous `insights`
+    subtree atomically.
+
+    Returns 404 if the session_id doesn't exist (same shape as /push).
+    """
+    if (resp := _503_if_no_db()) is not None:
+        return resp
+
+    body = await _read_json(request)
+    if not isinstance(body, dict):
+        return _json_error(400, "missing fields")
+
+    raw_id = body.get("session_id")
+    session_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    insights = body.get("insights")
+    if not session_id or not isinstance(insights, dict):
+        return _json_error(400, "session_id and insights object required")
+
+    try:
+        ok = await db.save_insights(session_id, insights)
+    except db.MongoNotConfigured as e:
+        return _json_error(503, str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("save insights failed")
+        return _json_error(500, str(e))
+
+    if not ok:
+        return _json_error(404, "session not found")
+    return web.json_response({"ok": True})
 
 
 async def get_root(_request: web.Request) -> web.Response:
@@ -313,6 +379,7 @@ def build_app() -> web.Application:
     app.router.add_post("/start-session", post_start_session)
     app.router.add_get("/start-session", get_start_session)
     app.router.add_post("/push", post_push)
+    app.router.add_post("/insights", post_insights)
     app.router.add_get("/transcripts", get_transcripts)
     app.router.add_get("/transcript/{session_id}", get_transcript)
     return app

@@ -259,6 +259,50 @@ export function useSessionPersistence(httpUrl) {
     [pushLine, persistenceEnabled]
   );
 
+  // ── save AI Meeting Intelligence into the existing session ────────────
+  // POST /insights → updates `session.insights = { summary, keyPoints,
+  // actionItems, topics, timeline, flashcards, quiz, studyVault }`. No
+  // separate collection or document — everything lives on the same
+  // session record as the transcript, so a future GET /transcript/:id
+  // returns the whole meeting in one query.
+  const saveInsights = useCallback(
+    async (insights) => {
+      const id = sessionIdRef.current;
+      if (!id) {
+        const msg =
+          "No active session. Click Start Translation first so the " +
+          "insights have a session to attach to.";
+        setError(msg);
+        return { ok: false, reason: "no-session", message: msg };
+      }
+      if (!persistenceEnabled) {
+        const msg =
+          "Session persistence is disabled. Set MONGO_URI in backend/.env.";
+        setError(msg);
+        return { ok: false, reason: "disabled", message: msg };
+      }
+      if (!insights || typeof insights !== "object") {
+        return { ok: false, reason: "bad-payload", message: "no insights to save" };
+      }
+      try {
+        const data = await _post("/insights", { session_id: id, insights });
+        if (data === null) {
+          return { ok: false, reason: "disabled", message: "Persistence disabled" };
+        }
+        if (data && data.ok) {
+          return { ok: true, sessionId: id };
+        }
+        return { ok: false, reason: "unknown", message: "Backend returned non-ok" };
+      } catch (e) {
+        console.warn("[session] save insights failed:", e);
+        const msg = `Save insights failed: ${e.message}`;
+        setError(msg);
+        return { ok: false, reason: "error", message: msg };
+      }
+    },
+    [_post, persistenceEnabled]
+  );
+
   // ── session history ────────────────────────────────────────────────────
 
   const listSessions = useCallback(async () => {
@@ -281,6 +325,17 @@ export function useSessionPersistence(httpUrl) {
       try {
         const data = await _get(`/transcript/${encodeURIComponent(sid)}`);
         if (data === null) return null;
+        // Backend now returns {text, insights?}. Return the whole
+        // object so callers (SessionHistory) can show the saved AI
+        // sections in the same load — single query, full meeting.
+        // Stays backward-compatible: callers that only `.text` it
+        // still get the right field.
+        if (data && typeof data === "object" && "insights" in data) {
+          return {
+            text: typeof data.text === "string" ? data.text : "",
+            insights: data.insights || null,
+          };
+        }
         return typeof data.text === "string" ? data.text : "";
       } catch (e) {
         console.warn("[session] load /transcript failed:", e);
@@ -306,6 +361,7 @@ export function useSessionPersistence(httpUrl) {
     startSession,
     pushLine,
     flushFinals,
+    saveInsights,
     listSessions,
     loadSession,
     resetSession,

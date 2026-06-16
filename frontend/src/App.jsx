@@ -463,7 +463,12 @@ export default function App() {
         </div>
 
         <div className="mt-4">
-          <InsightsPanel finals={mergedFinals} />
+          <InsightsPanel
+            finals={mergedFinals}
+            sessionId={persistence.sessionId}
+            saveInsights={persistence.saveInsights}
+            persistenceEnabled={persistence.persistenceEnabled}
+          />
         </div>
       </main>
 
