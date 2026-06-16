@@ -421,6 +421,21 @@ export default function App() {
           </div>
         ) : null}
 
+        {!persistence.persistenceEnabled && persistence.persistenceReason ? (
+          <div className="px-4 py-2 rounded-md bg-amber-950/40 border border-amber-700 text-amber-200 text-sm">
+            <div className="font-medium mb-1">
+              Session history is off — transcripts won't be saved to MongoDB.
+            </div>
+            <div className="text-amber-100/90">{persistence.persistenceReason}</div>
+            <div className="mt-1 text-xs text-amber-300/80">
+              Live transcription still works. Edit{" "}
+              <code className="text-amber-100">backend/.env</code> and restart
+              the backend (<code className="text-amber-100">python main.py</code>)
+              to enable saving.
+            </div>
+          </div>
+        ) : null}
+
         {!translating ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
             Click <span className="font-medium">Start Translation</span> and pick a
@@ -448,7 +463,12 @@ export default function App() {
         </div>
 
         <div className="mt-4">
-          <InsightsPanel finals={mergedFinals} />
+          <InsightsPanel
+            finals={mergedFinals}
+            sessionId={persistence.sessionId}
+            saveInsights={persistence.saveInsights}
+            persistenceEnabled={persistence.persistenceEnabled}
+          />
         </div>
       </main>
 

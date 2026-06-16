@@ -1,26 +1,34 @@
 import { useCallback, useEffect, useState } from "react";
+import { Brain, Archive } from "lucide-react";
+import { MeetingIntelligenceSections } from "./InsightsPanel.jsx";
 
 /**
  * SessionHistory
  * --------------
- * A drawer that lists past saved sessions (from `GET /transcripts`)
- * and lets the user load any of them into a read-only viewer
- * (`GET /transcript/:session_id`).
+ * Drawer that lists past saved sessions (`GET /transcripts`) and, when
+ * one is clicked, renders the **complete saved meeting** — transcript
+ * plus every AI Meeting Intelligence section (Summary, Key Points,
+ * Action Items, Topics, Timeline, Flashcards, Quiz, Study Vault) —
+ * using the exact same React components the live `<InsightsPanel/>`
+ * uses during generation.
  *
- * This component intentionally does NOT touch the live transcript
- * panel, the audio pipelines, or the WebSocket flow. It only reads
- * from the session-storage API. Loading a previous session opens its
- * text in a separate viewer area inside the drawer; the live
- * captioning UI keeps running underneath, exactly as before.
+ * Reopening a saved session feels like reopening the meeting, not
+ * opening a transcript file. The sidebar (left column) is unchanged;
+ * only the right-hand viewer swaps from a transcript-only `<pre>` to
+ * a full meeting view when the loaded session has saved insights.
+ *
+ * Loading flow:
+ *   click row -> loadSession(id) -> {text, insights?}
+ *               -> render Transcript + (if insights) full intelligence stack
  *
  * Props
  * -----
- *   open        : boolean — drawer visibility
- *   onClose     : () => void — close handler
- *   listSessions: () => Promise<Array<{id,label,createdAt}>>
- *   loadSession : (id: string) => Promise<string|null>  // returns saved text
- *   currentSessionId : string | null — id of the in-progress session,
- *                                       highlighted in the list
+ *   open              : drawer visibility
+ *   onClose           : close handler
+ *   listSessions      : () => Promise<[{id,label,createdAt}]>
+ *   loadSession       : (id) => Promise<string | {text, insights} | null>
+ *   currentSessionId  : id of the in-progress session, highlighted in
+ *                       the list
  */
 export default function SessionHistory({
   open,
@@ -35,6 +43,7 @@ export default function SessionHistory({
 
   const [selectedId, setSelectedId] = useState(null);
   const [viewerText, setViewerText] = useState("");
+  const [viewerInsights, setViewerInsights] = useState(null);
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState("");
 
@@ -60,16 +69,33 @@ export default function SessionHistory({
     async (sid) => {
       setSelectedId(sid);
       setViewerText("");
+      setViewerInsights(null);
       setViewerError("");
       setViewerLoading(true);
       try {
-        const text = await loadSession(sid);
-        if (text === null) {
+        // loadSession returns either a string (transcript-only legacy
+        // sessions) or an object {text, insights} when AI Meeting
+        // Intelligence was previously saved on the same record. The
+        // backend ships both in a single GET /transcript/:id response,
+        // so the "Load Session → Load Transcript → Load Saved AI
+        // Intelligence → Render Complete Meeting View" flow is one
+        // request, not three.
+        const result = await loadSession(sid);
+        if (result === null) {
           setViewerError(
             "Could not load this session. The backend may not be configured for persistence."
           );
+        } else if (typeof result === "string") {
+          setViewerText(result || "(this session has no saved transcript yet)");
         } else {
-          setViewerText(text || "(this session has no saved transcript yet)");
+          setViewerText(
+            result.text && result.text.length > 0
+              ? result.text
+              : "(this session has no saved transcript yet)"
+          );
+          if (result.insights && typeof result.insights === "object") {
+            setViewerInsights(result.insights);
+          }
         }
       } catch (e) {
         setViewerError(e.message || "Failed to load session");
@@ -103,7 +129,7 @@ export default function SessionHistory({
           top: 0,
           right: 0,
           bottom: 0,
-          width: "min(720px, 92vw)",
+          width: "min(960px, 96vw)",
           background: "#0f172a",
           borderLeft: "1px solid #334155",
           boxShadow: "-12px 0 32px rgba(0,0,0,0.5)",
@@ -180,7 +206,7 @@ export default function SessionHistory({
             gap: 0,
           }}
         >
-          {/* List pane */}
+          {/* List pane (sidebar — unchanged per the spec) */}
           <div
             style={{
               borderRight: "1px solid #334155",
@@ -277,7 +303,7 @@ export default function SessionHistory({
             </ul>
           </div>
 
-          {/* Viewer pane */}
+          {/* Viewer pane — full meeting view */}
           <div
             style={{
               overflowY: "auto",
@@ -288,7 +314,10 @@ export default function SessionHistory({
           >
             {!selectedId ? (
               <p style={{ color: "#64748b", margin: 0 }}>
-                Select a session on the left to view its saved transcript.
+                Select a session on the left to reopen the complete meeting:
+                transcript, summary, key points, action items, topics,
+                timeline, flashcards, quiz, and study vault — exactly as it
+                looked when it was generated.
               </p>
             ) : viewerLoading ? (
               <p style={{ color: "#94a3b8", margin: 0 }}>Loading…</p>
@@ -305,27 +334,180 @@ export default function SessionHistory({
                 {viewerError}
               </div>
             ) : (
-              <pre
-                style={{
-                  margin: 0,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                  fontFamily:
-                    "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                  fontSize: 12,
-                  color: "#e2e8f0",
-                  background: "#0b1220",
-                  border: "1px solid #1e293b",
-                  borderRadius: 8,
-                  padding: "12px 14px",
-                }}
-              >
-                {viewerText}
-              </pre>
+              <SavedMeetingView
+                sessionId={selectedId}
+                transcriptText={viewerText}
+                insights={viewerInsights}
+              />
             )}
           </div>
         </div>
       </aside>
     </>
+  );
+}
+
+/**
+ * SavedMeetingView
+ * ----------------
+ * Renders a full saved meeting in the order required by the spec:
+ *
+ *   Transcript
+ *     ↓
+ *   AI Meeting Intelligence (header)
+ *     ↓ Summary ↓ Key Points ↓ Action Items ↓ Topics
+ *     ↓ Timeline ↓ Flashcards ↓ Quiz ↓ Study Vault
+ *
+ * The intelligence stack is rendered through the *same*
+ * `<MeetingIntelligenceSections/>` component that the live
+ * `<InsightsPanel/>` uses, so a re-opened meeting looks identical to
+ * a freshly-generated one. The Study Vault section is given a
+ * read-only metadata block (savedAt + lineCount) instead of a Save
+ * button — the meeting is already saved.
+ */
+function SavedMeetingView({ sessionId, transcriptText, insights }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* ── Transcript ───────────────────────────────────────────────── */}
+      <section>
+        <h3
+          style={{
+            margin: "0 0 8px",
+            fontSize: 13,
+            fontWeight: 700,
+            color: "#cbd5e1",
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Transcript
+        </h3>
+        <pre
+          style={{
+            margin: 0,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            fontFamily:
+              "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+            fontSize: 12,
+            color: "#e2e8f0",
+            background: "#0b1220",
+            border: "1px solid #1e293b",
+            borderRadius: 8,
+            padding: "12px 14px",
+          }}
+        >
+          {transcriptText}
+        </pre>
+      </section>
+
+      {/* ── AI Meeting Intelligence ──────────────────────────────────── */}
+      {insights ? (
+        <section
+          style={{
+            background: "rgba(15,23,42,0.95)",
+            border: "1px solid rgba(139,92,246,0.25)",
+            borderRadius: 16,
+            padding: "20px 22px",
+            backdropFilter: "blur(12px)",
+            fontFamily: "ui-sans-serif, system-ui, sans-serif",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              marginBottom: 18,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+              <Brain size={20} style={{ color: "#a855f7" }} />
+              <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#f1f5f9" }}>
+                AI Meeting Intelligence
+              </h2>
+              <span style={{ fontSize: 11, color: "#64748b", marginLeft: 4 }}>
+                Saved meeting · session {sessionId}
+              </span>
+            </div>
+          </div>
+
+          <MeetingIntelligenceSections
+            insights={insights}
+            vaultSection={<SavedVaultMetadata insights={insights} />}
+          />
+        </section>
+      ) : (
+        <p
+          style={{
+            margin: 0,
+            fontSize: 12,
+            color: "#64748b",
+            background: "rgba(139,92,246,0.05)",
+            border: "1px dashed rgba(139,92,246,0.25)",
+            borderRadius: 8,
+            padding: "10px 12px",
+          }}
+        >
+          No AI Meeting Intelligence has been saved for this session yet.
+          Open the live transcript, generate insights, then click{" "}
+          <strong>Save Current Insights</strong> to attach them to this session.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Read-only Study Vault contents for a saved meeting.
+ * Replaces the live "Save Current Insights" button with the metadata
+ * recorded at save time, so the user sees *when* this meeting was
+ * archived without being offered to re-save it.
+ */
+function SavedVaultMetadata({ insights }) {
+  const sv = insights && typeof insights.studyVault === "object" ? insights.studyVault : null;
+  const savedAt = sv?.savedAt ? new Date(sv.savedAt) : null;
+  const savedLabel =
+    savedAt && !Number.isNaN(savedAt.getTime())
+      ? savedAt.toLocaleString()
+      : null;
+  return (
+    <div
+      style={{
+        background: "rgba(6,182,212,0.05)",
+        border: "1px solid rgba(6,182,212,0.15)",
+        borderRadius: 10,
+        padding: "12px 14px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <Archive size={14} style={{ color: "#22d3ee" }} />
+        <span style={{ fontSize: 12, fontWeight: 700, color: "#67e8f9" }}>
+          Saved meeting
+        </span>
+      </div>
+      <div style={{ fontSize: 11, color: "#94a3b8" }}>
+        {savedLabel ? <>Archived {savedLabel}</> : "Archived"}
+        {sv?.lineCount != null ? (
+          <> · {sv.lineCount} transcript line{sv.lineCount === 1 ? "" : "s"}</>
+        ) : null}
+      </div>
+      <p
+        style={{
+          margin: "4px 0 0",
+          fontSize: 11,
+          color: "#475569",
+          lineHeight: 1.5,
+        }}
+      >
+        This meeting is already saved in the session document — the same
+        record that holds the transcript above. To capture changes, regenerate
+        and save from the live transcript view.
+      </p>
+    </div>
   );
 }
