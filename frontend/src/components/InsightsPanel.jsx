@@ -348,12 +348,55 @@ export default function InsightsPanel({
   sessionId,
   saveInsights,
   persistenceEnabled,
+  // When set, the panel mounts in "saved session" mode:
+  //   - `insights` is pre-populated from the saved record
+  //   - the Save button still works but writes back to `sessionId`
+  //     (which the parent points at the saved meeting's id)
+  // Pair this with a unique `key` in the parent if you want a fully
+  // fresh component instance on session switch.
+  initialInsights = null,
+  // When true the panel is being used to render a saved meeting
+  // rather than the live one. The Generate button label changes to
+  // "Regenerate Insights" (no "Generate AI Insights" first-run copy)
+  // and the Study Vault save button becomes "Update saved meeting"
+  // so the affordance matches the user's mental model.
+  savedView = false,
 }) {
-  const [insights, setInsights] = useState(null);
+  const [insights, setInsights] = useState(initialInsights || null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [vault, setVault] = useState([]);
-  const [saved, setSaved] = useState(false);
+  // When opening a saved meeting (savedView + initialInsights set),
+  // pre-populate the in-memory vault list with the meeting's
+  // existing snapshot so the Study Vault section looks exactly like
+  // it did right after the user originally clicked "Save Current
+  // Insights" — single entry, savedAt + lineCount + summary visible.
+  // Without this the section would say "No saved sessions yet" on a
+  // freshly-opened saved meeting, which contradicts the spec ("the
+  // page should look identical to when the meeting was originally
+  // generated").
+  const [vault, setVault] = useState(() => {
+    if (!initialInsights) return [];
+    const sv =
+      initialInsights.studyVault && typeof initialInsights.studyVault === "object"
+        ? initialInsights.studyVault
+        : null;
+    const savedAtIso = sv?.savedAt;
+    const savedAtLabel =
+      savedAtIso && !Number.isNaN(new Date(savedAtIso).getTime())
+        ? new Date(savedAtIso).toLocaleString()
+        : "Saved meeting";
+    return [
+      {
+        id: `restored-${savedAtIso || Date.now()}`,
+        savedAt: savedAtLabel,
+        lineCount: sv?.lineCount ?? (Array.isArray(finals) ? finals.length : 0),
+        ...initialInsights,
+      },
+    ];
+  });
+  // In saved-session mode the meeting is already in MongoDB, so the
+  // Save button starts in "saved" state until the user regenerates.
+  const [saved, setSaved] = useState(savedView);
   // Status of the most recent persist-to-MongoDB attempt. Drives the
   // small status pill next to the "Save Current Insights" button so
   // the user knows whether their click actually wrote to the session
@@ -493,8 +536,8 @@ Quiz: options array has exactly 4 items, answer must match one option exactly.`;
           {persistStatus === "saving"
             ? <><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving…</>
             : saved
-              ? <><Check size={13} /> Saved to Vault</>
-              : <><Archive size={13} /> Save Current Insights</>}
+              ? <><Check size={13} /> {savedView ? "Saved meeting" : "Saved to Vault"}</>
+              : <><Archive size={13} /> {savedView ? "Update saved meeting" : "Save Current Insights"}</>}
         </button>
 
         {persistStatus === "saved" && (

@@ -467,3 +467,22 @@ async def get_session_full(session_id: str) -> Optional[dict]:
     if not doc:
         return None
     return _serialize_session(doc)
+
+
+async def delete_session(session_id: str) -> bool:
+    """
+    Remove a session document from MongoDB.
+
+    The whole record (transcript text + insights subtree + audio
+    metadata) lives in a single document by design, so a single
+    `delete_one` is enough — no fan-out across `vault` /
+    `meeting_intelligence` / `quiz` / `flashcards` collections,
+    because those collections don't exist in this project.
+
+    Returns True if a document was actually removed, False if no
+    session with that id existed (so the HTTP layer can map it to a
+    404 — same shape as POST /push).
+    """
+    sessions = _require_sessions()
+    result = await sessions.delete_one({"session_id": session_id})
+    return result.deleted_count > 0
