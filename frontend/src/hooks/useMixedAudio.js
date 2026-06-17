@@ -98,6 +98,12 @@ export function useMixedAudio(onSystemAudio, onMicAudio) {
   const [error, setError] = useState(null);
   const [micDevices, setMicDevices] = useState([]);
   const [micDeviceId, setMicDeviceId] = useState("");
+  // Recording-side state. The recorder taps the *existing* mic /
+  // system MediaStreams (which the hook already owns) via a separate
+  // AudioContext and MediaStreamDestination, so the live worklet
+  // pipeline that feeds AssemblyAI / Whisper is completely unaffected
+  // — no second permission prompt, no double processing.
+  const [recordingActive, setRecordingActive] = useState(false);
 
   // Stable refs for callbacks so pipelines never need to be rebuilt
   // just because the parent re-renders with a new function identity.
@@ -110,6 +116,9 @@ export function useMixedAudio(onSystemAudio, onMicAudio) {
   // on every audio chunk.
   const sysPipelineRef = useRef(null);  // { ctx, src, node, stream }
   const micPipelineRef = useRef(null);
+  // Active recording session (set by startRecording, cleared by stopRecording).
+  // Shape: { ctx, dest, recorder, chunks, mimeType, startedAt, sourceNodes[] }
+  const recordingRef = useRef(null);
 
   // ── device enumeration ─────────────────────────────────────────────────
 
@@ -246,15 +255,212 @@ export function useMixedAudio(onSystemAudio, onMicAudio) {
     setMicActive(false);
   }, []);
 
-  // ── cleanup on unmount ─────────────────────────────────────────────────
+  // ── recording (full-session mix) ───────────────────────────────────────
+  // Taps whatever streams are active when start is called and routes
+  // them through a *separate* AudioContext + MediaStreamDestination
+  // into a MediaRecorder. The transcription pipeline keeps running
+  // unaffected because we read from the same MediaStreams without
+  // disconnecting the existing nodes.
+  //
+  // Picks the highest-quality MediaRecorder mime type the browser
+  // supports, in this order:
+  //   1. audio/webm;codecs=opus  — Chrome/Edge/Firefox
+  //   2. audio/webm              — older Chromium
+  //   3. audio/mp4               — Safari (macOS 14.4+)
+  //   4. ""                      — let the browser default
+  function _pickAudioMime() {
+    if (typeof MediaRecorder === "undefined") return "";
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4;codecs=mp4a",
+      "audio/mp4",
+    ];
+    for (const m of candidates) {
+      try {
+        if (MediaRecorder.isTypeSupported(m)) return m;
+      } catch { /* ignore */ }
+    }
+    return "";
+  }
+
+  const startRecording = useCallback(async () => {
+    setError(null);
+    if (recordingRef.current) return true; // already recording
+
+    const sources = [];
+    if (sysPipelineRef.current?.stream) {
+      sources.push({ kind: "system", stream: sysPipelineRef.current.stream });
+    }
+    if (micPipelineRef.current?.stream) {
+      sources.push({ kind: "mic", stream: micPipelineRef.current.stream });
+    }
+    if (sources.length === 0) {
+      // Nothing to record yet. Caller can retry once a stream
+      // becomes active.
+      return false;
+    }
+
+    if (typeof MediaRecorder === "undefined") {
+      setError("MediaRecorder is not supported in this browser; recording disabled.");
+      return false;
+    }
+
+    let ctx;
+    try {
+      // 48 kHz so the recorded file sounds clean even though the
+      // transcription path runs at 16 kHz. The mic/system streams
+      // can be safely tapped at any sample rate; the recorder
+      // resamples internally.
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      ctx = new AudioCtx({ sampleRate: 48000 });
+    } catch (e) {
+      setError(`Could not create recording AudioContext: ${e.message}`);
+      return false;
+    }
+
+    let dest;
+    try {
+      dest = ctx.createMediaStreamDestination();
+    } catch (e) {
+      try { await ctx.close(); } catch { /* ignore */ }
+      setError(`Could not create recording destination: ${e.message}`);
+      return false;
+    }
+
+    // Wire each active source into the destination via its own gain
+    // node so we can fade or mute individually later if needed.
+    const sourceNodes = [];
+    for (const { kind, stream } of sources) {
+      try {
+        const src = ctx.createMediaStreamSource(stream);
+        const gain = ctx.createGain();
+        // Slight per-source gain trim. System audio tends to come in
+        // hot from getDisplayMedia, so we knock it down a bit; mic
+        // gets a tiny boost so the user's voice is audible against
+        // the meeting audio.
+        gain.gain.value = kind === "system" ? 0.85 : 1.1;
+        src.connect(gain);
+        gain.connect(dest);
+        sourceNodes.push({ src, gain });
+      } catch (e) {
+        // Skip a stream that can't be tapped (already ended, etc.)
+        // rather than aborting the whole recording.
+        console.warn(`[recording] could not tap ${kind} stream:`, e);
+      }
+    }
+
+    if (sourceNodes.length === 0) {
+      try { await ctx.close(); } catch { /* ignore */ }
+      setError("No usable audio sources for recording.");
+      return false;
+    }
+
+    const mimeType = _pickAudioMime();
+    let recorder;
+    try {
+      recorder = mimeType
+        ? new MediaRecorder(dest.stream, { mimeType, audioBitsPerSecond: 96000 })
+        : new MediaRecorder(dest.stream, { audioBitsPerSecond: 96000 });
+    } catch (e) {
+      try { await ctx.close(); } catch { /* ignore */ }
+      setError(`MediaRecorder init failed: ${e.message}`);
+      return false;
+    }
+
+    const chunks = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    recorder.onerror = (ev) => {
+      console.warn("[recording] MediaRecorder error:", ev?.error || ev);
+    };
+
+    // 1-second timeslices so even a hard-killed tab leaves us with
+    // most of the audio in `chunks` rather than nothing.
+    try {
+      recorder.start(1000);
+    } catch (e) {
+      try { await ctx.close(); } catch { /* ignore */ }
+      setError(`MediaRecorder start failed: ${e.message}`);
+      return false;
+    }
+
+    recordingRef.current = {
+      ctx,
+      dest,
+      recorder,
+      chunks,
+      mimeType: recorder.mimeType || mimeType || "audio/webm",
+      startedAt: Date.now(),
+      sourceNodes,
+    };
+    setRecordingActive(true);
+    return true;
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    return new Promise((resolve) => {
+      const rec = recordingRef.current;
+      recordingRef.current = null;
+      if (!rec) {
+        setRecordingActive(false);
+        resolve(null);
+        return;
+      }
+
+      const finish = async () => {
+        const { ctx, sourceNodes, chunks, mimeType, startedAt } = rec;
+        for (const { src, gain } of sourceNodes) {
+          try { src.disconnect(); } catch { /* ignore */ }
+          try { gain.disconnect(); } catch { /* ignore */ }
+        }
+        try { await ctx.close(); } catch { /* ignore */ }
+        const blob = new Blob(chunks, { type: mimeType });
+        const durationSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+        setRecordingActive(false);
+        resolve({
+          blob,
+          mimeType,
+          duration: durationSec,
+          size: blob.size,
+        });
+      };
+
+      const { recorder } = rec;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.onstop = () => { finish(); };
+        try { recorder.stop(); }
+        catch (e) { console.warn("[recording] stop failed:", e); finish(); }
+      } else {
+        finish();
+      }
+    });
+  }, []);
 
   useEffect(() => {
     return () => {
       // Fire-and-forget teardown — component is unmounting.
       const sys = sysPipelineRef.current;
       const mic = micPipelineRef.current;
+      const rec = recordingRef.current;
       sysPipelineRef.current = null;
       micPipelineRef.current = null;
+      recordingRef.current = null;
+      // Recording cleanup runs first so its source nodes are
+      // disconnected before the underlying MediaStreams get torn down.
+      if (rec) {
+        try {
+          if (rec.recorder && rec.recorder.state !== "inactive") {
+            rec.recorder.stop();
+          }
+        } catch { /* noop */ }
+        for (const { src, gain } of rec.sourceNodes || []) {
+          try { src.disconnect(); } catch { /* noop */ }
+          try { gain.disconnect(); } catch { /* noop */ }
+        }
+        try { rec.ctx?.close(); } catch { /* noop */ }
+      }
       if (sys) {
         sys.stream?.getTracks().forEach((t) => t.stop());
         teardownPipeline(sys);
@@ -277,5 +483,9 @@ export function useMixedAudio(onSystemAudio, onMicAudio) {
     stopSystem,
     enableMic,
     disableMic,
+    // Recording (mic + system mix → MediaRecorder → Blob).
+    recordingActive,
+    startRecording,
+    stopRecording,
   };
 }

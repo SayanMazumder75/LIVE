@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Mic, Download, Loader2 } from "lucide-react";
 import TranscriptPanel from "./components/TranscriptPanel.jsx";
 import FloatingMicWidget from "./components/FloatingMicWidget.jsx";
 import SessionHistory, { formatSessionLabel } from "./components/SessionHistory.jsx";
@@ -38,6 +39,27 @@ function computePcm16Rms(arrayBuffer) {
   return Math.sqrt(sumSq / view.length);
 }
 
+/** Format a byte count as a compact human-readable string. */
+function formatBytes(bytes) {
+  if (!bytes || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** Format seconds as M:SS (or H:MM:SS for >=1h). */
+function formatDuration(totalSeconds) {
+  const s = Math.max(0, Math.round(totalSeconds || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = String(m).padStart(2, "0");
+  const ss = String(sec).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+
 export default function App() {
   const [language, setLanguage] = useState("en");
 
@@ -59,10 +81,17 @@ export default function App() {
   // recording, sockets, and audio capture keep running underneath
   // — we just swap what the page is showing — so "Back to Live
   // Session" is a state flip, not a restart.
-  //   { id, label, finals, insights, createdAt }
+  //   { id, label, finals, insights, audioUrl, audioDuration, createdAt }
   const [viewedSession, setViewedSession] = useState(null);
   const [viewedLoading, setViewedLoading] = useState(false);
   const [viewedError, setViewedError] = useState("");
+  // ── upload status for the current live session's recording ──────────
+  // Drives the inline "Uploading recording..." badge under the Live
+  // Transcript header so the user knows their meeting audio is being
+  // saved before they navigate away. Cleared on the next Start.
+  //   "" | "uploading" | "uploaded" | "error" | "skipped"
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [uploadMessage, setUploadMessage] = useState("");
 
   const langRef = useRef(language);
   useEffect(() => { langRef.current = language; }, [language]);
@@ -157,6 +186,9 @@ export default function App() {
     stopSystem,
     enableMic,
     disableMic,
+    recordingActive,
+    startRecording,
+    stopRecording,
   } = useMixedAudio(handleSystemAudio, handleMicAudio);
 
   // ── mode helpers ──────────────────────────────────────────────────────
@@ -177,14 +209,107 @@ export default function App() {
     const ok = await startSystem();
     if (!ok && language === "en") {
       sysSocket.stopSession();
+      return;
     }
-  }, [wsConnected, language, sysSocket.startSession, startSystem, sysSocket.stopSession, persistence.startSession]);
+    if (!ok) return;
+    // Reset upload state for the new session, then kick off a
+    // full-session recording. startRecording taps whatever streams
+    // useMixedAudio currently owns — at this point that's the
+    // freshly-started system audio (and mic too, if the user enabled
+    // it before pressing Start). The recording runs in parallel with
+    // the worklet pipeline that feeds AssemblyAI/Whisper.
+    setUploadStatus("");
+    setUploadMessage("");
+    if (persistence.recordingEnabled) {
+      try {
+        await startRecording();
+      } catch (e) {
+        console.warn("[recording] startRecording threw:", e);
+      }
+    }
+  }, [
+    wsConnected,
+    language,
+    sysSocket.startSession,
+    startSystem,
+    sysSocket.stopSession,
+    persistence.startSession,
+    persistence.recordingEnabled,
+    startRecording,
+  ]);
 
   const handleStopTranslation = useCallback(async () => {
+    // Finalize the recording FIRST so the MediaRecorder's last chunk
+    // lands before stopSystem tears down the underlying tracks.
+    // Capture the active session_id BEFORE stopSystem because some
+    // teardown paths reset it.
+    const sessionForUpload = persistence.sessionId;
+    let recording = null;
+    if (recordingActive) {
+      try {
+        recording = await stopRecording();
+      } catch (e) {
+        console.warn("[recording] stopRecording threw:", e);
+      }
+    }
+
     await stopSystem();
     sysSocket.stopSession();
     micSocket.stopSession();
-  }, [stopSystem, sysSocket.stopSession, micSocket.stopSession]);
+
+    // Background upload — the user can already navigate to History or
+    // open another session while we push the audio to Cloudinary. We
+    // keep them informed via the upload status badge.
+    if (!recording || !recording.blob || recording.blob.size === 0) {
+      setUploadStatus("skipped");
+      setUploadMessage("No audio captured for this session.");
+      return;
+    }
+    if (!sessionForUpload) {
+      setUploadStatus("skipped");
+      setUploadMessage(
+        "Recording saved locally only — no MongoDB session was active."
+      );
+      return;
+    }
+    if (!persistence.recordingEnabled) {
+      setUploadStatus("skipped");
+      setUploadMessage(
+        persistence.recordingReason ||
+          "Cloudinary not configured — recording was not uploaded."
+      );
+      return;
+    }
+
+    setUploadStatus("uploading");
+    setUploadMessage(
+      `Uploading ${formatBytes(recording.blob.size)}...`
+    );
+    const result = await persistence.uploadRecording(
+      sessionForUpload,
+      recording.blob,
+      recording.mimeType
+    );
+    if (result?.ok) {
+      setUploadStatus("uploaded");
+      setUploadMessage(
+        `Recording saved (${formatBytes(recording.blob.size)})`
+      );
+    } else {
+      setUploadStatus("error");
+      setUploadMessage(result?.message || "Recording upload failed.");
+    }
+  }, [
+    persistence.sessionId,
+    persistence.recordingEnabled,
+    persistence.recordingReason,
+    persistence.uploadRecording,
+    recordingActive,
+    stopRecording,
+    stopSystem,
+    sysSocket.stopSession,
+    micSocket.stopSession,
+  ]);
 
   // ── mic toggle ────────────────────────────────────────────────────────
   const handleToggleMic = useCallback(async () => {
@@ -326,6 +451,11 @@ export default function App() {
           rawText: text,
           finals,
           insights,
+          // Recording metadata, if Cloudinary upload happened on the
+          // session this row represents. Surfaced as a polished audio
+          // player card below the transcript.
+          audioUrl: result.audioUrl || "",
+          audioDuration: result.audioDuration || 0,
         });
         // Make sure the page jumps back to the top so the user
         // visually lands on the saved meeting, not partway through
@@ -539,6 +669,19 @@ export default function App() {
           </div>
         ) : null}
 
+        {/* Recording card — saved meetings only. Shows the audio
+            player + Download + duration + a hint when no recording
+            was captured. Hidden in live mode (the live equivalent is
+            the upload-status badge below the transcript header). */}
+        {isViewing ? (
+          <RecordingCard
+            audioUrl={viewedSession.audioUrl}
+            audioDuration={viewedSession.audioDuration}
+            sessionLabel={viewedSession.label}
+            sessionId={viewedSession.id}
+          />
+        ) : null}
+
         {viewedLoading ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
             Loading saved session…
@@ -634,6 +777,33 @@ export default function App() {
           </div>
         ) : null}
 
+        {/* Upload-status badge — only meaningful for the live session
+            after Stop Translation has been clicked. Sits inline with
+            other status messages so the user sees where their
+            recording went without scrolling. */}
+        {!isViewing && uploadStatus ? (
+          <UploadStatusBadge status={uploadStatus} message={uploadMessage} />
+        ) : null}
+
+        {/* Cloudinary not configured — one-line hint, only shown
+            outside saved-view (saved sessions either have a
+            recording already, or were captured before Cloudinary
+            was set up). */}
+        {!isViewing &&
+        !persistence.recordingEnabled &&
+        persistence.recordingReason &&
+        persistence.persistenceEnabled ? (
+          <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-600 text-slate-300 text-xs">
+            <span className="font-medium text-slate-200">
+              Audio recording is off.
+            </span>{" "}
+            {persistence.recordingReason} Set
+            {" "}<code className="text-slate-100">CLOUDINARY_*</code> in
+            {" "}<code className="text-slate-100">backend/.env</code> and
+            restart the backend to enable session recordings.
+          </div>
+        ) : null}
+
         {!persistence.persistenceEnabled && persistence.persistenceReason ? (
           <div className="px-4 py-2 rounded-md bg-amber-950/40 border border-amber-700 text-amber-200 text-sm">
             <div className="font-medium mb-1">
@@ -704,6 +874,284 @@ export default function App() {
         currentSessionId={persistence.sessionId}
         viewedSessionId={viewedSession?.id || null}
       />
+    </div>
+  );
+}
+
+/**
+ * RecordingCard
+ * -------------
+ * Polished audio-player card shown above the transcript when a saved
+ * session has a Cloudinary-backed recording. Designed to mirror the
+ * cyan colour family of the "Viewing Saved Session" banner so the
+ * card and banner read as a single unit.
+ *
+ * The audio player uses the browser's native controls — they're more
+ * accessible than a custom waveform and they handle keyboard /
+ * screen-reader interactions out of the box. A separate Download
+ * button fetches the file as a Blob and triggers a download with a
+ * sensible filename, so the user gets `meeting-1234.webm` instead of
+ * Cloudinary's hash-based URL filename.
+ *
+ * If no recording exists for the session (audioUrl is empty) we
+ * render a soft "no recording" hint instead of an empty card, so the
+ * absence is explicit rather than confusing.
+ */
+function RecordingCard({ audioUrl, audioDuration, sessionLabel, sessionId }) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
+
+  const handleDownload = useCallback(async () => {
+    if (!audioUrl) return;
+    setDownloading(true);
+    setDownloadError("");
+    try {
+      const res = await fetch(audioUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const ext = (() => {
+        const t = (blob.type || "").toLowerCase();
+        if (t.includes("webm")) return "webm";
+        if (t.includes("mp4") || t.includes("m4a")) return "m4a";
+        if (t.includes("ogg")) return "ogg";
+        if (t.includes("wav")) return "wav";
+        if (t.includes("mpeg") || t.includes("mp3")) return "mp3";
+        return "webm";
+      })();
+      const safeLabel = (sessionLabel || `meeting-${sessionId}`)
+        .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80) || `meeting-${sessionId}`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${safeLabel}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setDownloadError(e.message || "Download failed");
+    } finally {
+      setDownloading(false);
+    }
+  }, [audioUrl, sessionLabel, sessionId]);
+
+  if (!audioUrl) {
+    return (
+      <div className="px-4 py-3 rounded-md bg-slate-800/60 border border-slate-700 text-slate-400 text-xs flex items-center gap-2">
+        <Mic size={14} aria-hidden="true" className="opacity-60" />
+        <span>
+          No audio recording was saved for this session. (Either it
+          was created before recording was enabled, or Cloudinary was
+          not configured at the time.)
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <section
+      aria-label="Meeting recording"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(6,182,212,0.08), rgba(15,23,42,0.95))",
+        border: "1px solid rgba(6,182,212,0.3)",
+        borderRadius: 14,
+        padding: "16px 18px",
+        boxShadow: "0 4px 16px rgba(6,182,212,0.06)",
+        display: "flex",
+        flexDirection: "column",
+        gap: 12,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div
+            aria-hidden="true"
+            style={{
+              width: 32,
+              height: 32,
+              borderRadius: 8,
+              background: "rgba(6,182,212,0.15)",
+              border: "1px solid rgba(6,182,212,0.4)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Mic size={16} style={{ color: "#22d3ee" }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <span
+              style={{
+                fontSize: 12,
+                fontWeight: 700,
+                letterSpacing: "0.06em",
+                textTransform: "uppercase",
+                color: "#67e8f9",
+              }}
+            >
+              Meeting Recording
+            </span>
+            <span style={{ fontSize: 11, color: "#94a3b8" }}>
+              Mic + System mix
+              {audioDuration ? ` · ${formatDuration(audioDuration)}` : ""}
+            </span>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleDownload}
+          disabled={downloading}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: "rgba(6,182,212,0.18)",
+            border: "1px solid rgba(6,182,212,0.45)",
+            color: "#67e8f9",
+            padding: "6px 12px",
+            borderRadius: 8,
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: downloading ? "wait" : "pointer",
+            transition: "background 0.15s, color 0.15s",
+          }}
+        >
+          {downloading ? (
+            <>
+              <Loader2
+                size={13}
+                style={{ animation: "spin 1s linear infinite" }}
+              />
+              Preparing…
+            </>
+          ) : (
+            <>
+              <Download size={13} />
+              Download
+            </>
+          )}
+        </button>
+      </div>
+
+      <audio
+        controls
+        src={audioUrl}
+        preload="metadata"
+        style={{
+          width: "100%",
+          // Keep the native controls on dark backgrounds — most browsers
+          // honour `color-scheme: dark` for media element styling.
+          colorScheme: "dark",
+        }}
+      />
+
+      {downloadError ? (
+        <div
+          style={{
+            fontSize: 11,
+            color: "#fca5a5",
+            background: "rgba(239,68,68,0.08)",
+            border: "1px solid rgba(239,68,68,0.25)",
+            borderRadius: 6,
+            padding: "6px 8px",
+          }}
+        >
+          {downloadError}
+        </div>
+      ) : null}
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </section>
+  );
+}
+
+/**
+ * UploadStatusBadge
+ * -----------------
+ * Inline status pill for the live session's recording upload. Sits
+ * under the Live Transcript header so the user sees the upload start
+ * → finish without leaving the page.
+ *
+ * status:
+ *   "uploading" — spinner + cyan
+ *   "uploaded"  — green check + size
+ *   "skipped"   — grey, with reason in the message
+ *   "error"     — red, with the failure message in the tooltip
+ */
+function UploadStatusBadge({ status, message }) {
+  if (!status) return null;
+  const palette =
+    status === "uploaded"
+      ? {
+          bg: "rgba(74,222,128,0.1)",
+          border: "rgba(74,222,128,0.3)",
+          color: "#4ade80",
+          icon: "●",
+        }
+      : status === "uploading"
+      ? {
+          bg: "rgba(6,182,212,0.1)",
+          border: "rgba(6,182,212,0.35)",
+          color: "#67e8f9",
+          icon: <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} />,
+        }
+      : status === "error"
+      ? {
+          bg: "rgba(239,68,68,0.1)",
+          border: "rgba(239,68,68,0.3)",
+          color: "#fca5a5",
+          icon: "✗",
+        }
+      : {
+          // skipped / anything else
+          bg: "rgba(148,163,184,0.1)",
+          border: "rgba(148,163,184,0.25)",
+          color: "#cbd5e1",
+          icon: "•",
+        };
+
+  return (
+    <div
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        background: palette.bg,
+        border: `1px solid ${palette.border}`,
+        color: palette.color,
+        padding: "6px 12px",
+        borderRadius: 99,
+        fontSize: 12,
+        alignSelf: "flex-start",
+      }}
+      title={message || ""}
+    >
+      <span aria-hidden="true">{palette.icon}</span>
+      <span style={{ fontWeight: 500 }}>
+        {status === "uploaded"
+          ? "Recording saved"
+          : status === "uploading"
+          ? "Uploading recording…"
+          : status === "error"
+          ? "Recording upload failed"
+          : "Recording not saved"}
+      </span>
+      {message ? (
+        <span style={{ color: "rgba(203,213,225,0.85)" }}>· {message}</span>
+      ) : null}
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }

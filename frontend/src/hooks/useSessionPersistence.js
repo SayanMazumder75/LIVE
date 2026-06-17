@@ -43,6 +43,12 @@ export function useSessionPersistence(httpUrl) {
   // allowlist, malformed URI, etc.) — surfaced via a UI banner so the
   // user can fix .env without scraping backend logs.
   const [persistenceReason, setPersistenceReason] = useState("");
+  // Cloudinary state. Reported by GET / so the UI can tell the user
+  // whether session recordings will actually be saved (vs. lost on
+  // refresh) before they hit Start Translation. Defaults to true so
+  // we don't flash a "disabled" banner before the first probe lands.
+  const [recordingEnabled, setRecordingEnabled] = useState(true);
+  const [recordingReason, setRecordingReason] = useState("");
 
   // Stable ref so push callbacks always read the *current* session_id
   // without being recreated by React.
@@ -142,6 +148,13 @@ export function useSessionPersistence(httpUrl) {
         } else {
           setPersistenceReason("");
         }
+        // Recording (Cloudinary) state lives alongside persistence on
+        // GET /, so we read both in the same probe.
+        const rec = data && data.recording;
+        if (rec && typeof rec === "object") {
+          setRecordingEnabled(Boolean(rec.enabled));
+          setRecordingReason(rec.enabled ? "" : (rec.error || ""));
+        }
       } catch (e) {
         // Backend HTTP server isn't reachable — we'll fall back to
         // the 503 path on first user action.
@@ -149,6 +162,10 @@ export function useSessionPersistence(httpUrl) {
           setPersistenceEnabled(false);
           setPersistenceReason(
             `Could not reach session API at ${baseUrl}. Is the backend running?`
+          );
+          setRecordingEnabled(false);
+          setRecordingReason(
+            `Could not reach session API at ${baseUrl}.`
           );
         }
       }
@@ -333,15 +350,18 @@ export function useSessionPersistence(httpUrl) {
         const data = await _get(`/transcript/${encodeURIComponent(sid)}`);
         if (data === null) return null;
         // Always return the structured shape so callers can rely on
-        // `.text` and `.insights` regardless of whether the session
-        // had any AI Meeting Intelligence saved on it. Older records
-        // without `insights` get `insights: null`.
+        // `.text`, `.insights`, `.audioUrl`, and `.audioDuration`
+        // regardless of whether the session had any AI Meeting
+        // Intelligence or recorded audio. Older records without a
+        // field get a falsy default.
         if (typeof data === "string") {
-          return { text: data, insights: null };
+          return { text: data, insights: null, audioUrl: "", audioDuration: 0 };
         }
         return {
           text: typeof data?.text === "string" ? data.text : "",
           insights: data?.insights || null,
+          audioUrl: typeof data?.audioUrl === "string" ? data.audioUrl : "",
+          audioDuration: Number(data?.audioDuration) || 0,
         };
       } catch (e) {
         console.warn("[session] load /transcript failed:", e);
@@ -350,6 +370,108 @@ export function useSessionPersistence(httpUrl) {
       }
     },
     [_get]
+  );
+
+  // ── upload a full-session audio recording ─────────────────────────────
+  // Mirrors the old project's POST /upload-audio call. The blob is
+  // built by useMixedAudio.stopRecording(); we just stream it through
+  // a multipart form so aiohttp can hand it to Cloudinary.
+  //
+  // Returns:
+  //   { ok: true, audioUrl, audioDuration }
+  //   { ok: false, reason: "no-session"|"disabled"|"size"|"error", message }
+  // Never throws — failures are best-effort like every other
+  // persistence method, so a Cloudinary outage doesn't break the
+  // live UI.
+  const uploadRecording = useCallback(
+    async (sid, blob, mimeType) => {
+      const targetId =
+        (typeof sid === "string" && sid.trim()) || sessionIdRef.current;
+      if (!targetId) {
+        return {
+          ok: false,
+          reason: "no-session",
+          message: "no active session to attach the recording to",
+        };
+      }
+      if (!persistenceEnabled) {
+        return {
+          ok: false,
+          reason: "disabled",
+          message: "Session persistence is disabled.",
+        };
+      }
+      if (!recordingEnabled) {
+        return {
+          ok: false,
+          reason: "disabled",
+          message:
+            recordingReason ||
+            "Audio recording is disabled on the backend (Cloudinary not configured).",
+        };
+      }
+      if (!blob || !(blob instanceof Blob) || blob.size === 0) {
+        return {
+          ok: false,
+          reason: "size",
+          message: "no recorded audio to upload",
+        };
+      }
+
+      const ext = pickExtension(mimeType || blob.type);
+      const filename = `session-${targetId}.${ext}`;
+      const file = new File([blob], filename, {
+        type: mimeType || blob.type || "audio/webm",
+      });
+
+      const form = new FormData();
+      form.append("session_id", targetId);
+      form.append("audio", file, filename);
+
+      try {
+        const res = await fetch(`${baseUrl}/upload-audio`, {
+          method: "POST",
+          body: form,
+        });
+        if (res.status === 503) {
+          let reason = "";
+          try {
+            const data = await res.json();
+            reason =
+              (data && (data.error || (data.diagnostics && data.diagnostics.error))) ||
+              "";
+          } catch (_e) {
+            /* ignore */
+          }
+          setRecordingEnabled(false);
+          setRecordingReason(reason || "Audio recording is disabled on the backend.");
+          return { ok: false, reason: "disabled", message: reason };
+        }
+        if (res.status === 404) {
+          return {
+            ok: false,
+            reason: "no-session",
+            message: "session not found on the backend",
+          };
+        }
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(`upload-audio ${res.status} ${text}`);
+        }
+        const data = await res.json();
+        return {
+          ok: true,
+          audioUrl: data?.audioUrl || "",
+          audioDuration: data?.audioDuration || 0,
+        };
+      } catch (e) {
+        console.warn("[session] upload-audio failed:", e);
+        const msg = `Recording upload failed: ${e.message}`;
+        setError(msg);
+        return { ok: false, reason: "error", message: msg };
+      }
+    },
+    [baseUrl, persistenceEnabled, recordingEnabled, recordingReason]
   );
 
   // Permanently remove a session from MongoDB (transcript + insights
@@ -419,16 +541,36 @@ export function useSessionPersistence(httpUrl) {
     sessionId,
     persistenceEnabled,
     persistenceReason,
+    recordingEnabled,
+    recordingReason,
     error,
     startSession,
     pushLine,
     flushFinals,
     saveInsights,
+    uploadRecording,
     listSessions,
     loadSession,
     deleteSession,
     resetSession,
   };
+}
+
+/**
+ * Map a MIME type from MediaRecorder to a sensible filename
+ * extension. Cloudinary sniffs by MIME first but having a real
+ * extension on the multipart filename helps when the upload is
+ * proxied through tools that strip headers.
+ */
+function pickExtension(mime) {
+  if (!mime) return "webm";
+  const m = mime.toLowerCase();
+  if (m.includes("webm")) return "webm";
+  if (m.includes("ogg")) return "ogg";
+  if (m.includes("mp4") || m.includes("m4a") || m.includes("aac")) return "m4a";
+  if (m.includes("wav")) return "wav";
+  if (m.includes("mpeg") || m.includes("mp3")) return "mp3";
+  return "webm";
 }
 
 /** Format a Date / ms timestamp as HH:MM:SS — matches old server.js. */
