@@ -3,6 +3,7 @@ import { Mic, Download, Loader2 } from "lucide-react";
 import TranscriptPanel from "./components/TranscriptPanel.jsx";
 import FloatingMicWidget from "./components/FloatingMicWidget.jsx";
 import SessionHistory, { formatSessionLabel } from "./components/SessionHistory.jsx";
+import ConceptDrawer from "./components/ConceptDrawer.jsx";
 import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
 import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
@@ -92,6 +93,20 @@ export default function App() {
   //   "" | "uploading" | "uploaded" | "error" | "skipped"
   const [uploadStatus, setUploadStatus] = useState("");
   const [uploadMessage, setUploadMessage] = useState("");
+  // ── AI Concept highlighting + drawer ────────────────────────────────
+  // liveInsights mirrors InsightsPanel's local insights state via the
+  // onInsightsChange callback; it lets us reach `concepts` /
+  // `conceptExplanations` from App without lifting the entire AI
+  // pipeline.
+  // selectedConcept + drawerOpen drive the right-side teacher drawer
+  // that pops out of a clicked highlight.
+  // conceptCache is keyed by concept name and survives across drawer
+  // open/close cycles within the same session, so re-clicking a
+  // concept never re-fires Groq.
+  const [liveInsights, setLiveInsights] = useState(null);
+  const [selectedConcept, setSelectedConcept] = useState(null);
+  const [conceptDrawerOpen, setConceptDrawerOpen] = useState(false);
+  const [conceptCache, setConceptCache] = useState({});
 
   const langRef = useRef(language);
   useEffect(() => { langRef.current = language; }, [language]);
@@ -521,6 +536,126 @@ export default function App() {
     [persistence.saveInsights, viewedSession]
   );
 
+  // Are we currently rendering a saved meeting in the main page?
+  // Declared here (not later in the render block) because
+  // effectiveInsights / handleConceptSave / etc. all need it. The
+  // late `panelSubtitle` / `transcriptSubtitle` / JSX still read the
+  // same value because `const` doesn't redeclare across the function.
+  const isViewing = viewedSession !== null;
+
+  // ── concept highlighting helpers ─────────────────────────────────────
+  // Whichever insights tree the page is currently rendering — the
+  // saved one if viewing history, otherwise the live InsightsPanel
+  // copy (mirrored via onInsightsChange).
+  const effectiveInsights = isViewing
+    ? viewedSession?.insights || null
+    : liveInsights;
+  const effectiveConcepts = useMemo(() => {
+    const list = effectiveInsights?.concepts;
+    if (!Array.isArray(list)) return [];
+    return list.filter(
+      (c) => c && typeof c.name === "string" && c.name.trim().length > 0
+    );
+  }, [effectiveInsights]);
+
+  // Hydrate the concept cache from whichever session the page is
+  // showing right now. When viewedSession changes, drop the previous
+  // session's cache so a stale "AVL Tree" explanation from session A
+  // never accidentally renders inside session B's drawer.
+  useEffect(() => {
+    const explanations = effectiveInsights?.conceptExplanations;
+    setConceptCache(
+      explanations && typeof explanations === "object" ? { ...explanations } : {}
+    );
+  }, [viewedSession?.id, effectiveInsights]);
+
+  // Build a small context blob for the Groq teacher prompt — meeting
+  // summary if available (highest signal), otherwise the first chunk
+  // of the transcript text. Bounded by ConceptDrawer to ~2000 chars.
+  const conceptContextText = useMemo(() => {
+    const parts = [];
+    if (effectiveInsights?.summary) parts.push(effectiveInsights.summary);
+    const transcriptBlob =
+      (isViewing && viewedSession?.rawText) ||
+      (Array.isArray(mergedFinals)
+        ? mergedFinals
+            .map((l) =>
+              l.translation && l.translation !== l.text
+                ? `${l.text}\n→ ${l.translation}`
+                : l.text || ""
+            )
+            .join("\n")
+        : "");
+    if (transcriptBlob) parts.push(transcriptBlob);
+    return parts.join("\n\n");
+  }, [effectiveInsights, isViewing, viewedSession, mergedFinals]);
+
+  const handleConceptClick = useCallback((concept) => {
+    if (!concept) return;
+    setSelectedConcept(concept);
+    setConceptDrawerOpen(true);
+  }, []);
+
+  const handleConceptDrawerClose = useCallback(() => {
+    setConceptDrawerOpen(false);
+  }, []);
+
+  // Cache the freshly-generated explanation so re-clicking the same
+  // concept in this session never fires Groq again. Does NOT persist
+  // — that's what the explicit Save button in the drawer is for.
+  const handleConceptGenerated = useCallback((concept, explanation) => {
+    if (!concept?.name || !explanation) return;
+    setConceptCache((prev) => ({ ...prev, [concept.name]: explanation }));
+  }, []);
+
+  // Persist a concept explanation into the EXISTING session's
+  // insights subtree. Same single-document-per-meeting rule as
+  // transcript / insights / audio — explanations live under
+  // `insights.conceptExplanations[name]` so a single
+  // GET /transcript/:id rehydrates them along with the rest.
+  const handleConceptSave = useCallback(
+    async (concept, explanation) => {
+      if (!concept?.name || !explanation) {
+        return { ok: false, message: "Nothing to save." };
+      }
+      const baseInsights = isViewing
+        ? viewedSession?.insights || null
+        : liveInsights;
+      if (!baseInsights) {
+        return {
+          ok: false,
+          message:
+            "Generate AI Insights first — concept explanations save into the same session.insights tree.",
+        };
+      }
+
+      const merged = {
+        ...baseInsights,
+        conceptExplanations: {
+          ...(baseInsights.conceptExplanations || {}),
+          [concept.name]: explanation,
+        },
+      };
+
+      const targetId = isViewing ? viewedSession.id : null;
+      const result = await persistence.saveInsights(merged, targetId);
+      if (!result?.ok) return result;
+
+      // Sync local state so the cache + section views reflect the
+      // new explanation without waiting for a reload.
+      if (isViewing) {
+        setViewedSession((prev) =>
+          prev ? { ...prev, insights: merged } : prev
+        );
+      } else {
+        setLiveInsights(merged);
+      }
+      setConceptCache((prev) => ({ ...prev, [concept.name]: explanation }));
+      return result;
+    },
+    [persistence, viewedSession, liveInsights, isViewing]
+  );
+
   const interim = micActive && micSocket.interim
     ? micSocket.interim
     : sysSocket.interim;
@@ -555,7 +690,9 @@ export default function App() {
   })();
 
   // Are we currently rendering a saved meeting in the main page?
-  const isViewing = viewedSession !== null;
+  // (See the earlier const isViewing = viewedSession !== null; near
+  // the concept-highlighting helpers — kept here as documentation
+  // for the section that originally introduced it.)
 
   // What goes into the live transcript components.
   // - In live mode  : real socket finals + interim partials.
@@ -846,6 +983,8 @@ export default function App() {
           <TranscriptPanel
             finals={transcriptFinalsForPage}
             interim={transcriptInterimForPage}
+            concepts={effectiveConcepts}
+            onConceptClick={handleConceptClick}
           />
         </div>
 
@@ -861,6 +1000,7 @@ export default function App() {
             persistenceEnabled={persistence.persistenceEnabled}
             initialInsights={insightsInitial}
             savedView={isViewing}
+            onInsightsChange={isViewing ? undefined : setLiveInsights}
           />
         </div>
       </main>
@@ -873,6 +1013,25 @@ export default function App() {
         onDeleteSession={handleDeleteSession}
         currentSessionId={persistence.sessionId}
         viewedSessionId={viewedSession?.id || null}
+      />
+
+      {/* Concept drawer — opens whenever the user clicks a
+          highlighted concept anywhere in the live or saved
+          transcript. Pre-fills from the in-memory cache (which
+          itself is hydrated from the session's saved
+          conceptExplanations on load), generates via Groq on first
+          click, and saves back into the same session.insights
+          subtree on demand. */}
+      <ConceptDrawer
+        open={conceptDrawerOpen}
+        onClose={handleConceptDrawerClose}
+        concept={selectedConcept}
+        contextText={conceptContextText}
+        cached={
+          selectedConcept ? conceptCache[selectedConcept.name] || null : null
+        }
+        onGenerated={handleConceptGenerated}
+        onSave={handleConceptSave}
       />
     </div>
   );
