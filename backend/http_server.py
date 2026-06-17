@@ -34,6 +34,7 @@ from typing import Any
 from aiohttp import web
 
 import db
+import cloudinary_service
 
 logger = logging.getLogger("http_server")
 
@@ -283,6 +284,13 @@ async def get_transcript(request: web.Request) -> web.Response:
     response: dict = {"text": full.get("text", "") or ""}
     if "insights" in full and full["insights"] is not None:
         response["insights"] = full["insights"]
+    # Audio fields ride along on the same response so a single
+    # GET /transcript/:id returns the complete saved meeting —
+    # transcript, insights, AND the recording — in one round trip.
+    if full.get("audioUrl"):
+        response["audioUrl"] = full["audioUrl"]
+    if full.get("audioDuration"):
+        response["audioDuration"] = full["audioDuration"]
     return web.json_response(response)
 
 
@@ -390,8 +398,121 @@ async def get_root(_request: web.Request) -> web.Response:
             "service": "AI Transcriber session API",
             "persistence": "enabled" if db.is_enabled() else "disabled",
             "diagnostics": db.diagnostics(),
+            # Frontend reads this so the recording UI can show a
+            # one-line "Cloudinary not configured — recordings disabled"
+            # banner without having to make an extra round-trip.
+            "recording": cloudinary_service.diagnostics(),
         }
     )
+
+
+async def post_upload_audio(request: web.Request) -> web.Response:
+    """
+    POST /upload-audio (multipart)
+
+    Form fields:
+      - session_id : the session this recording belongs to
+      - audio      : the WebM/Opus blob produced by MediaRecorder
+
+    Mirrors the old `server.js` `/upload-audio` route. Uploads the
+    blob to Cloudinary, then sets `audioUrl` + `audioDuration` on the
+    EXISTING session document in MongoDB — no separate `recordings`
+    collection. A subsequent GET /transcript/:id returns the audio
+    URL alongside text + insights.
+
+    Returns:
+      200 {"audioUrl": "https://...", "audioDuration": N}
+      400 missing fields
+      404 session not found
+      503 if MongoDB or Cloudinary is not configured (with a clear
+          per-service error message so the frontend can tell the user
+          exactly which env vars to fill in)
+    """
+    if (resp := _503_if_no_db()) is not None:
+        return resp
+
+    if not cloudinary_service.is_configured():
+        return web.json_response(
+            {
+                "error": (
+                    "Audio recording is disabled — "
+                    + cloudinary_service.configuration_error()
+                ),
+                "diagnostics": cloudinary_service.diagnostics(),
+            },
+            status=503,
+        )
+
+    # Stream-parse the multipart body so we don't have to slurp the
+    # whole audio file into memory before the disk-backed parser does
+    # the same thing.
+    try:
+        reader = await request.multipart()
+    except Exception as e:  # noqa: BLE001
+        return _json_error(400, f"could not read multipart body: {e}")
+
+    session_id = ""
+    audio_bytes: bytes = b""
+
+    async for part in reader:
+        if part.name == "session_id":
+            session_id = (await part.text()).strip()
+        elif part.name == "audio":
+            chunks: list[bytes] = []
+            while True:
+                chunk = await part.read_chunk(size=64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            audio_bytes = b"".join(chunks)
+        else:
+            await part.read()  # drain any unexpected fields
+
+    if not session_id:
+        return _json_error(400, "session_id required")
+    if not audio_bytes:
+        return _json_error(400, "audio file required")
+
+    # Confirm the session exists before paying for the Cloudinary
+    # upload — keeps stale recordings from leaking into Cloudinary if
+    # the client posts a bogus / deleted session_id.
+    existing = await db.find_session(session_id)
+    if existing is None:
+        return _json_error(404, "session not found")
+
+    try:
+        upload = await cloudinary_service.upload_audio(
+            audio_bytes, public_id=session_id
+        )
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=503)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("cloudinary upload failed")
+        return _json_error(500, f"upload failed: {e}")
+
+    audio_url = upload.get("url") or ""
+    audio_duration = int(upload.get("duration") or 0)
+    if not audio_url:
+        return _json_error(500, "Cloudinary returned no URL")
+
+    try:
+        await db.update_audio(session_id, audio_url, audio_duration)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("db.update_audio failed")
+        return _json_error(500, f"db update failed: {e}")
+
+    return web.json_response(
+        {
+            "audioUrl": audio_url,
+            "audioDuration": audio_duration,
+        }
+    )
+
+
+# Original get_root marker — replaced above; keeping this anchor for the
+# build_app() router below.
+def _routes_anchor():
+    return None
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -413,12 +534,20 @@ async def _read_json(request: web.Request) -> Any:
 
 def build_app() -> web.Application:
     """Build the aiohttp Application with all routes registered."""
-    app = web.Application(middlewares=[cors_middleware])
+    # 100 MB upper bound on request bodies. Audio recordings encoded
+    # at 16 kHz Opus run ~30 MB/hr in the worst case, so 100 MB
+    # comfortably covers a 2-3 hour meeting. Keeps the server from
+    # OOM'ing on a misbehaving / malicious client.
+    app = web.Application(
+        middlewares=[cors_middleware],
+        client_max_size=100 * 1024 * 1024,
+    )
     app.router.add_get("/", get_root)
     app.router.add_post("/start-session", post_start_session)
     app.router.add_get("/start-session", get_start_session)
     app.router.add_post("/push", post_push)
     app.router.add_post("/insights", post_insights)
+    app.router.add_post("/upload-audio", post_upload_audio)
     app.router.add_get("/transcripts", get_transcripts)
     app.router.add_get("/transcript/{session_id}", get_transcript)
     app.router.add_delete("/transcript/{session_id}", delete_transcript)

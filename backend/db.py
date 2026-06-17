@@ -499,6 +499,45 @@ async def get_session_full(session_id: str) -> Optional[dict]:
     return _serialize_session(doc)
 
 
+async def get_session_full(session_id: str) -> Optional[dict]:
+    """
+    Load the entire session document (transcript text + insights) so a
+    single query returns everything the client needs to rehydrate a
+    saved meeting. Returns None when no document with that session_id
+    exists.
+    """
+    sessions = _require_sessions()
+    doc = await sessions.find_one({"session_id": session_id})
+    if not doc:
+        return None
+    return _serialize_session(doc)
+
+
+async def update_audio(
+    session_id: str, audio_url: str, audio_duration: int
+) -> bool:
+    """
+    Persist the post-session audio recording's URL + duration onto the
+    EXISTING session document. The same single-document-per-meeting
+    rule as transcript and insights — no separate `recordings`
+    collection.
+
+    Returns True if the session existed and was updated, False if no
+    record with that session_id was found.
+    """
+    sessions = _require_sessions()
+    result = await sessions.update_one(
+        {"session_id": session_id},
+        {
+            "$set": {
+                "audioUrl": audio_url or "",
+                "audioDuration": int(audio_duration or 0),
+            }
+        },
+    )
+    return result.matched_count > 0
+
+
 async def delete_session(session_id: str) -> bool:
     """
     Remove a session document from MongoDB.
