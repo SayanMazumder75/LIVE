@@ -12,6 +12,9 @@ import {
   RefreshCw,
   Check,
   AlertTriangle,
+  ClipboardList,
+  CheckCircle2,
+  HelpCircle,
 } from "lucide-react";
 import { DiagramView } from "./ConceptDiagrams.jsx";
 
@@ -33,6 +36,9 @@ import { DiagramView } from "./ConceptDiagrams.jsx";
  *                           with placeholder labels AND a Real Example
  *                           with concrete values. Stacks vertically on
  *                           narrow viewports (mobile / split screen).
+ *   - Solved Example      — beginner-friendly worked problem: question,
+ *                           numbered steps with optional inline diagrams,
+ *                           highlighted Final Answer + Beginner Tip.
  *   - Exam Questions      — 3-5 academic-style questions
  *   - Interview Questions — 3-5 industry / behavioural prompts
  *
@@ -482,6 +488,309 @@ function SectionCard({ icon: Icon, title, color, children }) {
   );
 }
 
+/**
+ * SolvedExampleBlock
+ * ------------------
+ * Renders a beginner-friendly worked example with the spec's
+ * required structure:
+ *
+ *   📝 Question
+ *
+ *   Step 1
+ *   Diagram (optional)
+ *   Explanation
+ *
+ *   Step 2
+ *   ...
+ *
+ *   Final Answer
+ *
+ *   💡 Beginner Tip
+ *
+ * Steps are connected by a vertical accent rail so the sequence
+ * reads top-to-bottom even when individual explanations wrap.
+ * Inline diagrams reuse <DiagramView/> from ConceptDiagrams so a
+ * BST insertion sequence shows the tree growing one node at a time
+ * with the same SVG renderer used by the main Diagram section.
+ *
+ * Defensive against a malformed payload: missing question, empty
+ * steps array, or missing finalAnswer / beginnerTip — the section
+ * shows whatever fields ARE present and silently skips the rest.
+ */
+function SolvedExampleBlock({ data }) {
+  if (!data || typeof data !== "object") return null;
+  const question = typeof data.question === "string" ? data.question.trim() : "";
+  const steps = Array.isArray(data.steps) ? data.steps.filter(Boolean) : [];
+  const finalAnswer =
+    typeof data.finalAnswer === "string" ? data.finalAnswer.trim() : "";
+  const beginnerTip =
+    typeof data.beginnerTip === "string" ? data.beginnerTip.trim() : "";
+
+  // If the LLM gave us nothing useful, render nothing rather than
+  // an empty card.
+  if (!question && steps.length === 0 && !finalAnswer && !beginnerTip) {
+    return null;
+  }
+
+  return (
+    <SectionCard
+      icon={ClipboardList}
+      title="Solved Example"
+      color="#fb7185"
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {/* Question card — distinct from the steps so the prompt
+            reads like an exam paper at a glance. */}
+        {question ? (
+          <div
+            style={{
+              background: "rgba(251,113,133,0.08)",
+              border: "1px solid rgba(251,113,133,0.3)",
+              borderRadius: 8,
+              padding: "10px 12px",
+              display: "flex",
+              gap: 8,
+              alignItems: "flex-start",
+            }}
+          >
+            <span
+              aria-hidden="true"
+              style={{ fontSize: 14, lineHeight: "20px" }}
+            >
+              📝
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  color: "#fda4af",
+                  marginBottom: 4,
+                }}
+              >
+                Question
+              </div>
+              <p style={{ margin: 0, fontSize: 13, color: "#e2e8f0", lineHeight: 1.55 }}>
+                {question}
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Step list — numbered badges with a vertical rail so the
+            sequence is visually unmistakable. */}
+        {steps.length > 0 ? (
+          <ol
+            style={{
+              listStyle: "none",
+              margin: 0,
+              padding: 0,
+              display: "flex",
+              flexDirection: "column",
+              gap: 14,
+            }}
+          >
+            {steps.map((step, i) => {
+              const stepTitle =
+                typeof step.title === "string" ? step.title.trim() : "";
+              const stepExplanation =
+                typeof step.explanation === "string"
+                  ? step.explanation.trim()
+                  : typeof step.text === "string"
+                  ? step.text.trim()
+                  : "";
+              const stepDiagram = step.diagram || null;
+              const isLast = i === steps.length - 1;
+              return (
+                <li
+                  key={i}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "30px 1fr",
+                    gap: 12,
+                    position: "relative",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 26,
+                        height: 26,
+                        borderRadius: "50%",
+                        background: "rgba(251,113,133,0.15)",
+                        border: "1.5px solid #fb7185",
+                        color: "#fda4af",
+                        fontSize: 11,
+                        fontWeight: 700,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {i + 1}
+                    </div>
+                    {!isLast ? (
+                      <div
+                        style={{
+                          width: 1,
+                          flex: 1,
+                          background: "rgba(251,113,133,0.25)",
+                          marginTop: 4,
+                          minHeight: 12,
+                        }}
+                      />
+                    ) : null}
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 6,
+                      paddingBottom: isLast ? 0 : 4,
+                      minWidth: 0,
+                    }}
+                  >
+                    {stepTitle ? (
+                      <div
+                        style={{
+                          fontSize: 12,
+                          fontWeight: 700,
+                          color: "#fecdd3",
+                        }}
+                      >
+                        {stepTitle}
+                      </div>
+                    ) : null}
+                    {stepExplanation ? (
+                      <p
+                        style={{
+                          margin: 0,
+                          fontSize: 12.5,
+                          color: "#cbd5e1",
+                          lineHeight: 1.55,
+                        }}
+                      >
+                        {stepExplanation}
+                      </p>
+                    ) : null}
+                    {stepDiagram ? (
+                      <div style={{ marginTop: 4 }}>
+                        <DiagramView
+                          diagram={stepDiagram}
+                          accent="#fb7185"
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        ) : null}
+
+        {/* Final Answer — green confirmation box. */}
+        {finalAnswer ? (
+          <div
+            style={{
+              background: "rgba(34,197,94,0.08)",
+              border: "1px solid rgba(34,197,94,0.3)",
+              borderRadius: 8,
+              padding: "10px 12px",
+              display: "flex",
+              gap: 8,
+              alignItems: "flex-start",
+            }}
+          >
+            <CheckCircle2
+              size={14}
+              style={{ color: "#4ade80", marginTop: 2, flexShrink: 0 }}
+            />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  color: "#4ade80",
+                  marginBottom: 4,
+                }}
+              >
+                Final Answer
+              </div>
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: 13,
+                  color: "#e2e8f0",
+                  lineHeight: 1.55,
+                }}
+              >
+                {finalAnswer}
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Beginner Tip — amber lightbulb box. Same colour family as
+            the Why Needed section so the visual language is
+            consistent throughout the drawer. */}
+        {beginnerTip ? (
+          <div
+            style={{
+              background: "rgba(245,158,11,0.08)",
+              border: "1px solid rgba(245,158,11,0.3)",
+              borderRadius: 8,
+              padding: "10px 12px",
+              display: "flex",
+              gap: 8,
+              alignItems: "flex-start",
+            }}
+          >
+            <Lightbulb
+              size={14}
+              style={{ color: "#fbbf24", marginTop: 2, flexShrink: 0 }}
+            />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  color: "#fbbf24",
+                  marginBottom: 4,
+                }}
+              >
+                Beginner Tip
+              </div>
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: 13,
+                  color: "#e2e8f0",
+                  lineHeight: 1.55,
+                }}
+              >
+                {beginnerTip}
+              </p>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </SectionCard>
+  );
+}
+
 function ExplanationBody({ explanation }) {
   const e = explanation || {};
   const examQuestions = Array.isArray(e.examQuestions) ? e.examQuestions : [];
@@ -542,6 +851,15 @@ function ExplanationBody({ explanation }) {
             ) : null}
           </div>
         </SectionCard>
+      ) : null}
+
+      {/* Solved Example — a worked problem with step-by-step
+          solution + final answer + beginner tip. Sits between
+          Diagram and Exam Questions per the spec. Doesn't render
+          when the LLM didn't return one (older cached explanations
+          predate the field). */}
+      {e.solvedExample ? (
+        <SolvedExampleBlock data={e.solvedExample} />
       ) : null}
 
       {examQuestions.length ? (
@@ -644,6 +962,7 @@ Return ONLY valid JSON (no markdown, no prose around it). Use this EXACT shape:
   "realLifeExample": "A concrete relatable example, in 2-4 sentences. Avoid jargon.",
   "diagram": <DIAGRAM-OBJECT for the concept structure (see DIAGRAM SPEC below)>,
   "exampleDiagram": <DIAGRAM-OBJECT for a real example with concrete values>,
+  "solvedExample": <SOLVED-EXAMPLE-OBJECT (see SOLVED EXAMPLE SPEC below)>,
   "examQuestions": ["short academic-style question 1", "...", "...", "..."],
   "interviewQuestions": ["short industry / behavioural question 1", "...", "...", "..."]
 }
@@ -738,7 +1057,72 @@ the REAL EXAMPLE teaches the same shape with simpler concrete values.
 Both should include their own short "rule" line.
 
 ────────────────────────────────────────
-EXAMPLE diagram OBJECT for "Binary Search Tree":
+SOLVED EXAMPLE SPEC
+────────────────────────────────────────
+A SOLVED-EXAMPLE-OBJECT is a small worked problem a first-year
+student could read and follow:
+
+{
+  "question": "One short exam-style question (1-2 sentences).",
+  "steps": [
+    {
+      "title": "Step 1: Insert 50",
+      "explanation": "50 becomes the root since the tree is empty.",
+      "diagram": <DIAGRAM-OBJECT or null>   // optional — include when a snapshot of the data structure helps
+    },
+    {
+      "title": "Step 2: Insert 30",
+      "explanation": "30 < 50, so it goes to the left of the root.",
+      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value": "30"} } }
+    }
+  ],
+  "finalAnswer": "The single-sentence final answer / final state.",
+  "beginnerTip": "One-line key takeaway that helps avoid the most common beginner mistake."
+}
+
+REQUIREMENTS for Solved Example:
+- Generate 3-6 small steps. Steps should be tiny — each one does
+  ONE thing.
+- For each step, write a 1-2 sentence beginner-friendly explanation
+  in plain language. No jargon.
+- Include diagrams in steps that benefit from a visual snapshot
+  (data-structure operations, table-state changes, scheduling
+  decisions, packet flow). Skip the diagram for purely-prose steps
+  (e.g. "compare keys", "look up index").
+- Each step's diagram MUST be a full DIAGRAM-OBJECT following the
+  DIAGRAM SPEC above — do NOT use ascii inside steps.
+- Keep the example small and concrete (≤ 4 numbers / rows / processes).
+- finalAnswer is one short sentence.
+- beginnerTip is one short sentence — the rule of thumb.
+
+TOPIC-SPECIFIC GUIDANCE for Solved Example:
+- DSA (Tree / BST / AVL / Heap / Linked List / Stack / Queue / Trie / Graph):
+    Show insertion / deletion / search step-by-step with the data
+    structure evolving in each step's diagram.
+    Example: 'Insert 50, 30, 70, 20 into an empty BST' → 4 steps,
+    each with a diagram of the BST after that insertion.
+- DBMS / Database Relationships:
+    Show small tables (kind:'ascii' for table grids is OK here, or
+    kind:'list' for short row sequences) and SQL/operation steps.
+    Example: 'Apply σ_age>18(STUDENTS) on a 4-row table' → step 1
+    shows the table, step 2 shows the predicate evaluated row-by-row,
+    step 3 shows the resulting subset.
+- OS Scheduling:
+    Show the Gantt chart progressing one quantum at a time, or the
+    ready/blocked queues evolving. Use kind:'queue' for ready
+    queues and kind:'ascii' for Gantt charts.
+    Example: 'Schedule P1(2ms), P2(5ms), P3(1ms) under FCFS' → step
+    1 shows arrival, step 2 dispatches P1, etc.
+- Networking / Routing:
+    Show the packet's hop-by-hop journey or the routing-table
+    lookup. Use kind:'graph' with directed edges for hop traces.
+    Example: 'Trace packet from Delhi to Chennai through this
+    network' → each step shows the current hop highlighted on the
+    graph.
+- Concepts with no obvious worked example (e.g. abstract
+  philosophy, broad survey terms): use the realLifeExample as a
+  jumping-off point and walk through it analytically; diagrams are
+  optional in this case.
 ────────────────────────────────────────
 "diagram": {
   "kind": "tree",
@@ -757,6 +1141,33 @@ EXAMPLE diagram OBJECT for "Binary Search Tree":
     "right": { "value": "70", "left": {"value":"60"}, "right": {"value":"80"} }
   },
   "rule": "Left < Parent < Right"
+},
+"solvedExample": {
+  "question": "Insert 50, 30, 70, 20 into an empty BST. Show the tree after each insertion.",
+  "steps": [
+    {
+      "title": "Step 1: Insert 50",
+      "explanation": "The tree is empty, so 50 becomes the root.",
+      "diagram": { "kind": "tree", "root": { "value": "50" } }
+    },
+    {
+      "title": "Step 2: Insert 30",
+      "explanation": "30 < 50, so it goes to the LEFT of the root.",
+      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value":"30"} } }
+    },
+    {
+      "title": "Step 3: Insert 70",
+      "explanation": "70 > 50, so it goes to the RIGHT of the root.",
+      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value":"30"}, "right": {"value":"70"} } }
+    },
+    {
+      "title": "Step 4: Insert 20",
+      "explanation": "20 < 50 → go left. 20 < 30 → go left of 30. Place there.",
+      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value":"30", "left": {"value":"20"}}, "right": {"value":"70"} } }
+    }
+  ],
+  "finalAnswer": "Final BST has root 50 with 30 (left) and 70 (right); 20 hangs under 30 on the left.",
+  "beginnerTip": "Always start at the root: smaller goes left, larger goes right, then repeat."
 }
 ────────────────────────────────────────
 
