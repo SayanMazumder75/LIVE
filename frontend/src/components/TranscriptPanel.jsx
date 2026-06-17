@@ -321,6 +321,16 @@ function ConceptTooltip({ concept }) {
   // The tooltip renders inside the same span, positioned absolutely.
   // It's intentionally pointer-events:none so hover-tracking on the
   // parent stays stable when the tooltip overflows the bubble edge.
+  //
+  // IMPORTANT: every child here must be a phrasing-content element
+  // (span / a / strong / etc.), NOT a block element like <div>. The
+  // tooltip is rendered inside <ConceptHighlight/> which is a <span>
+  // which itself is rendered inside <p className="transcript-bubble-text">
+  // (and the translation <p>). React's HTML validator throws
+  //   validateDOMNesting(...): <div> cannot appear as a descendant of <p>
+  // on any block element nested under <p>. Using <span style={{ display:
+  // "block" }}> gives us the visual stacking we want without the DOM
+  // nesting violation.
   return (
     <span
       role="tooltip"
@@ -345,8 +355,9 @@ function ConceptTooltip({ concept }) {
         pointerEvents: "none",
       }}
     >
-      <div
+      <span
         style={{
+          display: "block",
           fontWeight: 700,
           color: "#c4b5fd",
           marginBottom: 3,
@@ -354,14 +365,21 @@ function ConceptTooltip({ concept }) {
         }}
       >
         {concept.name}
-      </div>
+      </span>
       {concept.summary ? (
-        <div style={{ color: "#cbd5e1", marginBottom: 4 }}>
+        <span
+          style={{
+            display: "block",
+            color: "#cbd5e1",
+            marginBottom: 4,
+          }}
+        >
           {concept.summary}
-        </div>
+        </span>
       ) : null}
-      <div
+      <span
         style={{
+          display: "block",
           color: "#a78bfa",
           fontSize: 10,
           fontStyle: "italic",
@@ -369,7 +387,7 @@ function ConceptTooltip({ concept }) {
         }}
       >
         Click for full explanation →
-      </div>
+      </span>
     </span>
   );
 }

@@ -647,7 +647,20 @@ ${trimmedContext || "(no additional context provided)"}
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      messages: [{ role: "user", content: prompt }],
+      // `response_format: json_object` asks Groq for strict JSON.
+      // The endpoint accepts the same OpenAI-style flag, and even
+      // when it's silently ignored by an older model the
+      // extractJsonObject() fallback below still recovers the
+      // payload. Belt and braces.
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a precise study-guide generator. Reply with a single JSON object only, no markdown, no preamble, no closing remarks.",
+        },
+        { role: "user", content: prompt },
+      ],
       temperature: 0.4,
       max_tokens: 1600,
     }),
@@ -658,11 +671,122 @@ ${trimmedContext || "(no additional context provided)"}
   }
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content || "";
-  const clean = text.replace(/```json\n?|```/g, "").trim();
+
   try {
-    return JSON.parse(clean);
+    return extractJsonObject(text);
   } catch (e) {
-    console.error("Groq returned invalid JSON:\n", clean.slice(0, 400));
-    throw new Error("Groq returned invalid JSON.");
+    // Surface what Groq actually returned in the dev console — the
+    // user-facing message stays short. Helps debug the rare case
+    // where even the recovery extractor can't find a JSON object.
+    console.error(
+      "[ConceptDrawer] could not parse Groq response:",
+      e.message,
+      "\nRaw response (first 800 chars):\n",
+      text.slice(0, 800)
+    );
+    throw new Error(
+      "The teacher response wasn't valid JSON. Try Regenerate, or check the console for the raw output."
+    );
+  }
+}
+
+/**
+ * Robust extractor for "JSON object somewhere inside an LLM reply".
+ *
+ * LLMs are inconsistent about how they hand back JSON:
+ *   1. Bare object:           {"definition": "..."}
+ *   2. Wrapped in ```json ... ```  fences
+ *   3. Wrapped in plain ``` fences  with no language tag
+ *   4. Preamble prose ("Sure, here is the JSON:") then the object
+ *   5. Postscript prose ("Hope this helps!") after the object
+ *   6. Trailing commas before } or ] (technically invalid JSON)
+ *   7. Mixed quotes / smart quotes — handled implicitly by JSON.parse
+ *      when it succeeds; we don't try to repair that ourselves.
+ *
+ * We strip code fences, locate the *first* `{` and walk the string
+ * tracking string-literal context + brace depth to find its matching
+ * `}`. The substring between them is the JSON candidate. Then we
+ * try JSON.parse, and if that throws we strip trailing commas as a
+ * last-ditch repair before re-trying.
+ *
+ * Throws if no JSON object is recoverable.
+ */
+function extractJsonObject(input) {
+  if (input == null) throw new Error("empty response");
+  // Sometimes the LLM returns a parsed object directly (some SDKs
+  // unwrap `response_format: json_object` for you). Defensive pass-
+  // through so callers don't have to special-case it.
+  if (typeof input === "object") return input;
+
+  let s = String(input).trim();
+
+  // Strip leading + trailing markdown code fences (```json, ``` js, ```
+  // — language tag optional, surrounding whitespace tolerated).
+  s = s.replace(/^```[a-zA-Z0-9_-]*\s*\n?/i, "");
+  s = s.replace(/\n?\s*```\s*$/i, "");
+  s = s.trim();
+
+  const start = s.indexOf("{");
+  if (start < 0) {
+    throw new Error("no JSON object found in response");
+  }
+
+  // Walk forward from `start` finding the matching closing brace.
+  // Track:
+  //   - inString:    inside a "..." string literal (braces don't count)
+  //   - escapeNext:  previous char was a backslash (so this char is
+  //                  part of an escape, not a closing quote)
+  //   - depth:       current nesting depth of {}
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+  let end = -1;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    if (inString) {
+      if (c === "\\") {
+        escapeNext = true;
+        continue;
+      }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      continue;
+    }
+    if (c === "{") {
+      depth += 1;
+    } else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+
+  if (end < 0) {
+    throw new Error("unbalanced braces around JSON object");
+  }
+
+  const candidate = s.slice(start, end + 1);
+
+  try {
+    return JSON.parse(candidate);
+  } catch (firstErr) {
+    // Last-ditch repair: drop trailing commas before } or ]. LLMs
+    // often produce these by mistake; everything else (bad quotes,
+    // unescaped newlines) is too risky to auto-repair.
+    const repaired = candidate.replace(/,(\s*[}\]])/g, "$1");
+    try {
+      return JSON.parse(repaired);
+    } catch (_e2) {
+      throw new Error(`JSON.parse failed: ${firstErr.message}`);
+    }
   }
 }
