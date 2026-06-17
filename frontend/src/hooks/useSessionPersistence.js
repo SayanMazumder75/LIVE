@@ -352,6 +352,62 @@ export function useSessionPersistence(httpUrl) {
     [_get]
   );
 
+  // Permanently remove a session from MongoDB (transcript + insights
+  // + audio metadata, all in one shot — there's only one document
+  // per session by design). The frontend handles the user-confirmation
+  // popup; this method assumes the user already said yes.
+  //
+  // Returns:
+  //   { ok: true }                      — session deleted.
+  //   { ok: false, reason: "missing" }  — backend says no such id (404).
+  //   { ok: false, reason: "disabled" } — MongoDB persistence is off.
+  //   { ok: false, reason: "error", message: "..." } — network / 5xx.
+  const deleteSession = useCallback(
+    async (sid) => {
+      if (!sid) return { ok: false, reason: "missing", message: "no id" };
+      if (!persistenceEnabled) {
+        return {
+          ok: false,
+          reason: "disabled",
+          message: "Session persistence is disabled.",
+        };
+      }
+      try {
+        const url = `${baseUrl}/transcript/${encodeURIComponent(sid)}`;
+        const res = await fetch(url, { method: "DELETE" });
+        if (res.status === 503) {
+          let reason = "";
+          try {
+            const data = await res.json();
+            reason =
+              (data && (data.error || (data.diagnostics && data.diagnostics.error))) ||
+              "";
+          } catch (_e) {
+            /* ignore */
+          }
+          setPersistenceEnabled(false);
+          setPersistenceReason(reason || "Session persistence is disabled on the backend.");
+          return { ok: false, reason: "disabled", message: reason };
+        }
+        if (res.status === 404) {
+          // Already gone — caller can treat as success and refresh.
+          return { ok: false, reason: "missing", message: "session not found" };
+        }
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(`DELETE ${res.status} ${text}`);
+        }
+        return { ok: true };
+      } catch (e) {
+        console.warn("[session] delete failed:", e);
+        const msg = `Delete failed: ${e.message}`;
+        setError(msg);
+        return { ok: false, reason: "error", message: msg };
+      }
+    },
+    [baseUrl, persistenceEnabled]
+  );
+
   // ── reset (used when user clears transcripts client-side) ──────────────
 
   const resetSession = useCallback(() => {
@@ -370,6 +426,7 @@ export function useSessionPersistence(httpUrl) {
     saveInsights,
     listSessions,
     loadSession,
+    deleteSession,
     resetSession,
   };
 }

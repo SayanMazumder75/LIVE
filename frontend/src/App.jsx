@@ -343,6 +343,35 @@ export default function App() {
     setViewedError("");
   }, []);
 
+  // Delete a saved session from MongoDB. SessionHistory has already
+  // shown the OK/Cancel popup before calling us, so by the time we
+  // get here the user has confirmed.
+  //
+  // After a successful delete:
+  //   - if the deleted session is currently rendered in the main
+  //     page, flip back to the live view (it can't show a meeting
+  //     that no longer exists),
+  //   - if the deleted session is the *live* one we're recording
+  //     into, detach the persistence hook from it so future /push
+  //     calls don't keep hitting a now-404 endpoint.
+  const handleDeleteSession = useCallback(
+    async (sessionId) => {
+      if (!sessionId) return { ok: false, reason: "missing", message: "no id" };
+      const result = await persistence.deleteSession(sessionId);
+      if (result?.ok || result?.reason === "missing") {
+        if (viewedSession && viewedSession.id === sessionId) {
+          setViewedSession(null);
+          setViewedError("");
+        }
+        if (persistence.sessionId === sessionId) {
+          persistence.resetSession();
+        }
+      }
+      return result;
+    },
+    [persistence, viewedSession]
+  );
+
   // saveInsights wrapper that targets the *currently-rendered* session.
   // In live mode that's the live session_id (handled by the hook's
   // default). In saved-session view, the user is editing the saved
@@ -664,6 +693,7 @@ export default function App() {
         onClose={() => setHistoryOpen(false)}
         listSessions={persistence.listSessions}
         onOpenSession={handleOpenSession}
+        onDeleteSession={handleDeleteSession}
         currentSessionId={persistence.sessionId}
         viewedSessionId={viewedSession?.id || null}
       />

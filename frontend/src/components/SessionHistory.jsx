@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Trash2, Loader2 } from "lucide-react";
 
 /**
  * SessionHistory
@@ -10,6 +11,12 @@ import { useCallback, useEffect, useState } from "react";
  * (App.jsx) then loads the session and replaces the main page with
  * the saved meeting using the same components that render the live
  * meeting (TranscriptPanel + InsightsPanel).
+ *
+ * Each row also has a trash icon button on the right. Clicking it
+ * pops a `window.confirm` dialog — same modal style the spec asked
+ * for ("OK to delete, Cancel to keep"). On OK we fire
+ * `onDeleteSession(id)`; on Cancel nothing happens. The trash click
+ * stops propagation so it doesn't also fire `onOpenSession`.
  *
  * In other words: the drawer behaves like "Open Meeting", not
  * "Preview Meeting". The user shouldn't be able to tell from the
@@ -24,6 +31,11 @@ import { useCallback, useEffect, useState } from "react";
  *   onOpenSession     : (id, meta) => void — fires when a row is
  *                       clicked. The drawer closes itself before the
  *                       parent runs its load + render.
+ *   onDeleteSession   : async (id, meta) => {ok, reason?, message?}
+ *                       fires when the user confirms the trash-icon
+ *                       prompt. The drawer awaits the result, refreshes
+ *                       the list on ok=true, and surfaces error
+ *                       messages inline.
  *   currentSessionId  : id of the in-progress live session, shown as
  *                       a "live" tag and highlighted in the list
  *   viewedSessionId   : id of the saved session currently rendered
@@ -36,12 +48,18 @@ export default function SessionHistory({
   onClose,
   listSessions,
   onOpenSession,
+  onDeleteSession,
   currentSessionId,
   viewedSessionId,
 }) {
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(false);
   const [refreshError, setRefreshError] = useState("");
+  // Per-row delete state. Map of session_id -> "deleting" while the
+  // request is in flight, and a separate map of session_id -> error
+  // message when something went wrong (404 / 503 / network).
+  const [deletingId, setDeletingId] = useState(null);
+  const [deleteError, setDeleteError] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -71,6 +89,55 @@ export default function SessionHistory({
       onOpenSession?.(session.id, session);
     },
     [onClose, onOpenSession]
+  );
+
+  // Trash-icon click: confirmation popup, then call onDeleteSession.
+  // Stops propagation so the row's main click handler doesn't also
+  // fire (which would open the meeting we're about to delete).
+  const handleDelete = useCallback(
+    async (session, event) => {
+      if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+      if (!session?.id) return;
+      if (!onDeleteSession) return;
+
+      const niceLabel = session.label || `Session ${session.id}`;
+      // window.confirm gives the OK/Cancel dialog the spec asked for —
+      // native, accessible, blocks until the user answers. No third-
+      // party modal needed.
+      const confirmed = window.confirm(
+        `Delete "${niceLabel}"?\n\n` +
+          `This will permanently remove the transcript, AI insights, ` +
+          `and study vault for this meeting from MongoDB. ` +
+          `This cannot be undone.`
+      );
+      if (!confirmed) return;
+
+      setDeletingId(session.id);
+      setDeleteError("");
+      try {
+        const result = await onDeleteSession(session.id, session);
+        if (result?.ok || result?.reason === "missing") {
+          // Optimistically drop the row immediately so the user sees
+          // the result even before the next /transcripts refresh.
+          setSessions((prev) => prev.filter((s) => s.id !== session.id));
+          // And ask the server for the authoritative list in the
+          // background so any race conditions sort themselves out.
+          refresh();
+        } else {
+          setDeleteError(
+            result?.message || "Could not delete this session."
+          );
+        }
+      } catch (e) {
+        setDeleteError(e.message || "Could not delete this session.");
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [onDeleteSession, refresh]
   );
 
   if (!open) return null;
@@ -204,6 +271,22 @@ export default function SessionHistory({
             </p>
           ) : null}
 
+          {deleteError ? (
+            <div
+              style={{
+                margin: "8px 12px",
+                padding: "8px 10px",
+                borderRadius: 6,
+                background: "rgba(239,68,68,0.1)",
+                border: "1px solid rgba(239,68,68,0.3)",
+                color: "#fca5a5",
+                fontSize: 12,
+              }}
+            >
+              {deleteError}
+            </div>
+          ) : null}
+
           <ul
             style={{
               listStyle: "none",
@@ -214,34 +297,51 @@ export default function SessionHistory({
             {sessions.map((s) => {
               const isCurrent = s.id === currentSessionId;
               const isViewed = s.id === viewedSessionId;
+              const isDeleting = deletingId === s.id;
               return (
-                <li key={s.id}>
+                <li
+                  key={s.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "stretch",
+                    background: isViewed ? "#1e3a5f" : "transparent",
+                    borderLeft: isViewed
+                      ? "3px solid #38bdf8"
+                      : isCurrent
+                      ? "3px solid #4ade80"
+                      : "3px solid transparent",
+                    opacity: isDeleting ? 0.5 : 1,
+                    transition: "opacity 0.15s",
+                  }}
+                >
+                  {/* Open button — fills the row, fires onOpenSession. */}
                   <button
                     type="button"
                     onClick={() => handleOpen(s)}
+                    disabled={isDeleting}
                     style={{
-                      width: "100%",
+                      flex: 1,
+                      minWidth: 0,
                       textAlign: "left",
-                      background: isViewed ? "#1e3a5f" : "transparent",
+                      background: "transparent",
                       border: "none",
-                      borderLeft: isViewed
-                        ? "3px solid #38bdf8"
-                        : isCurrent
-                        ? "3px solid #4ade80"
-                        : "3px solid transparent",
-                      padding: "12px 14px",
-                      cursor: "pointer",
+                      padding: "12px 6px 12px 11px",
+                      cursor: isDeleting ? "wait" : "pointer",
                       color: "#e2e8f0",
                       fontSize: 12,
                       display: "flex",
                       flexDirection: "column",
                       gap: 4,
+                      overflow: "hidden",
                     }}
                   >
                     <span
                       style={{
                         fontWeight: 500,
                         color: isCurrent ? "#4ade80" : "#e2e8f0",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
                       }}
                     >
                       {s.label || `Session ${s.id}`}
@@ -253,15 +353,71 @@ export default function SessionHistory({
                         fontFamily: "monospace",
                         fontSize: 10,
                         color: "#64748b",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
                       }}
                     >
                       {s.id}
                     </span>
                   </button>
+
+                  {/* Trash icon — confirms with window.confirm, then
+                      fires onDeleteSession. stopPropagation prevents
+                      the row's main onClick from also firing. */}
+                  <button
+                    type="button"
+                    aria-label={`Delete ${s.label || s.id}`}
+                    title={
+                      isCurrent
+                        ? "This session is currently recording — deleting it is allowed but won't stop the recording"
+                        : "Delete this saved session"
+                    }
+                    onClick={(e) => handleDelete(s, e)}
+                    disabled={isDeleting}
+                    style={{
+                      alignSelf: "stretch",
+                      width: 40,
+                      flexShrink: 0,
+                      background: "transparent",
+                      border: "none",
+                      borderLeft: "1px solid rgba(255,255,255,0.04)",
+                      color: isDeleting ? "#94a3b8" : "#94a3b8",
+                      cursor: isDeleting ? "wait" : "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      transition: "color 0.15s, background 0.15s",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isDeleting) {
+                        e.currentTarget.style.color = "#fca5a5";
+                        e.currentTarget.style.background = "rgba(239,68,68,0.1)";
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isDeleting) {
+                        e.currentTarget.style.color = "#94a3b8";
+                        e.currentTarget.style.background = "transparent";
+                      }
+                    }}
+                  >
+                    {isDeleting ? (
+                      <Loader2
+                        size={14}
+                        style={{ animation: "spin 1s linear infinite" }}
+                      />
+                    ) : (
+                      <Trash2 size={14} />
+                    )}
+                  </button>
                 </li>
               );
             })}
           </ul>
+
+          {/* Spinner keyframes for the trash button's loading state. */}
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
         </div>
       </aside>
     </>

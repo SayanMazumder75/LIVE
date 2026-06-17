@@ -62,7 +62,7 @@ async def cors_middleware(request: web.Request, handler):
 
 def _with_cors(resp: web.StreamResponse) -> web.StreamResponse:
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
@@ -343,6 +343,45 @@ async def post_insights(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def delete_transcript(request: web.Request) -> web.Response:
+    """
+    DELETE /transcript/{session_id}
+
+    Removes a saved session — transcript text, AI Meeting
+    Intelligence, audio metadata, all of it — from MongoDB. There is
+    only one document per session by design, so this is one
+    `delete_one` and the meeting is gone in its entirety.
+
+    Returns:
+      200 {"ok": true}                — session removed.
+      404 {"error": "session not found"} — no such session.
+      503 if MongoDB persistence is disabled.
+
+    The backend deliberately does *not* prompt for confirmation —
+    that's the frontend's job (window.confirm in SessionHistory). Once
+    a DELETE arrives here we delete; an HTTP API caller is presumed
+    to have already gathered any consent it needs.
+    """
+    if (resp := _503_if_no_db()) is not None:
+        return resp
+
+    session_id = request.match_info.get("session_id", "").strip()
+    if not session_id:
+        return _json_error(400, "session_id required")
+
+    try:
+        ok = await db.delete_session(session_id)
+    except db.MongoNotConfigured as e:
+        return _json_error(503, str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("delete session failed")
+        return _json_error(500, str(e))
+
+    if not ok:
+        return _json_error(404, "session not found")
+    return web.json_response({"ok": True})
+
+
 async def get_root(_request: web.Request) -> web.Response:
     """Liveness probe — same shape as the old `app.get("/")`."""
     return web.json_response(
@@ -382,6 +421,7 @@ def build_app() -> web.Application:
     app.router.add_post("/insights", post_insights)
     app.router.add_get("/transcripts", get_transcripts)
     app.router.add_get("/transcript/{session_id}", get_transcript)
+    app.router.add_delete("/transcript/{session_id}", delete_transcript)
     return app
 
 
