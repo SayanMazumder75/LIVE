@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Brain, ListChecks, CheckSquare, BookOpen,
   HelpCircle, Archive, Sparkles, ChevronDown,
@@ -456,6 +456,12 @@ export default function InsightsPanel({
   // and the Study Vault save button becomes "Update saved meeting"
   // so the affordance matches the user's mental model.
   savedView = false,
+  // Notifies the parent whenever the panel's `insights` state
+  // changes (generate / regenerate / saved-mode hydration). Lets
+  // App.jsx feed `concepts` to TranscriptPanel and the
+  // ConceptDrawer's cache without owning the rest of the insights
+  // state itself.
+  onInsightsChange,
 }) {
   const [insights, setInsights] = useState(initialInsights || null);
   const [loading, setLoading] = useState(false);
@@ -502,6 +508,15 @@ export default function InsightsPanel({
 
   const stats = speakerStats(finals);
 
+  // Notify parent whenever the local insights state changes so it
+  // can drive concept highlighting + the ConceptDrawer cache. Stable
+  // ref guards against re-running on every render.
+  const onInsightsChangeRef = useRef(onInsightsChange);
+  useEffect(() => { onInsightsChangeRef.current = onInsightsChange; }, [onInsightsChange]);
+  useEffect(() => {
+    onInsightsChangeRef.current?.(insights);
+  }, [insights]);
+
   const generate = useCallback(async () => {
     if (!finals.length) { setError("No transcript yet. Start session first."); return; }
     setLoading(true);
@@ -536,10 +551,20 @@ Return this exact JSON shape:
       "options": ["option A text", "option B text", "option C text", "option D text"],
       "answer": "exact text of correct option"
     }
+  ],
+  "concepts": [
+    { "name": "Concept Name", "summary": "One-line, beginner-friendly explanation of what it is." }
   ]
 }
 
-Generate 5 key points, 3-5 action items, 4 topics, 5 timeline events, 5 flashcards, 4 quiz questions.
+Generate 5 key points, 3-5 action items, 4 topics, 5 timeline events, 5 flashcards, 4 quiz questions, and 5-10 important concepts.
+
+For "concepts":
+- Pick the most important technical / domain terms / named entities the speakers actually use in the transcript.
+- Use the EXACT phrasing the speakers use ("AVL Tree", not "self-balancing binary search tree") so we can highlight the FIRST occurrence in the transcript text.
+- One-line summary should be a tooltip-sized explanation (10-20 words), beginner-friendly, no jargon.
+- Skip generic words like "meeting", "discussion", "team" — only meaty concepts that benefit from a teacher-style explanation.
+
 Quiz: options array has exactly 4 items, answer must match one option exactly.`;
 
     try {
