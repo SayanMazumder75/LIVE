@@ -100,23 +100,118 @@ function FlashcardDeck({ cards }) {
   const [flipped, setFlipped] = useState(false);
   if (!cards.length) return null;
   const card = cards[idx];
+
+  // 3D flip card. The outer wrapper sets the perspective so the
+  // rotation reads as a true card flip rather than a horizontal squish;
+  // the inner wrapper rotates around its Y axis with both faces
+  // absolutely positioned and `backfaceVisibility: hidden` so only
+  // the currently-facing one is visible. TERM and DEFINITION use
+  // distinct color themes (amber for the question, violet for the
+  // answer) so it's instantly clear which side you're looking at.
+  const minH = 130;
+  const faceBase = {
+    position: "absolute",
+    inset: 0,
+    minHeight: minH,
+    borderRadius: 10,
+    padding: "16px 18px",
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    backfaceVisibility: "hidden",
+    WebkitBackfaceVisibility: "hidden",
+    boxSizing: "border-box",
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {/* Perspective container — fixes the 3D vanishing point. */}
       <div
         onClick={() => setFlipped(!flipped)}
         style={{
-          cursor: "pointer", minHeight: 110, borderRadius: 10, padding: "16px 18px",
-          background: flipped ? "rgba(139,92,246,0.15)" : "rgba(255,255,255,0.04)",
-          border: `1px solid ${flipped ? "#8b5cf6" : "rgba(139,92,246,0.2)"}`,
-          transition: "all 0.2s", display: "flex", flexDirection: "column", gap: 8,
+          perspective: "1200px",
+          minHeight: minH,
+          cursor: "pointer",
         }}
       >
-        <span style={{ fontSize: 10, color: "#6b7280", fontWeight: 700,
-          textTransform: "uppercase", letterSpacing: "0.1em" }}>
-          {flipped ? "DEFINITION" : "TERM — tap to flip"}
-        </span>
-        <p style={{ margin: 0, fontSize: 14, color: flipped ? "#c4b5fd" : "#cbd5e1",
-          lineHeight: 1.6 }}>{flipped ? card.back : card.front}</p>
+        {/* Inner wrapper that actually rotates. */}
+        <div
+          style={{
+            position: "relative",
+            width: "100%",
+            minHeight: minH,
+            transition: "transform 0.6s cubic-bezier(0.4, 0.0, 0.2, 1)",
+            transformStyle: "preserve-3d",
+            transform: flipped ? "rotateY(180deg)" : "rotateY(0deg)",
+          }}
+        >
+          {/* TERM — front face, amber theme (question side). */}
+          <div
+            style={{
+              ...faceBase,
+              background: "rgba(245,158,11,0.08)",
+              border: "1px solid rgba(245,158,11,0.4)",
+              boxShadow: "0 4px 16px rgba(245,158,11,0.05)",
+            }}
+          >
+            <span
+              style={{
+                fontSize: 10,
+                color: "#f59e0b",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.1em",
+              }}
+            >
+              Term — tap to flip
+            </span>
+            <p
+              style={{
+                margin: 0,
+                fontSize: 14,
+                color: "#fde68a",
+                lineHeight: 1.6,
+              }}
+            >
+              {card.front}
+            </p>
+          </div>
+
+          {/* DEFINITION — back face, violet theme (answer side). Pre-
+              rotated 180deg so when the wrapper rotates it sits
+              flat for the viewer. */}
+          <div
+            style={{
+              ...faceBase,
+              transform: "rotateY(180deg)",
+              background: "rgba(139,92,246,0.15)",
+              border: "1px solid #8b5cf6",
+              boxShadow: "0 4px 16px rgba(139,92,246,0.12)",
+            }}
+          >
+            <span
+              style={{
+                fontSize: 10,
+                color: "#a78bfa",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.1em",
+              }}
+            >
+              Definition — tap to flip back
+            </span>
+            <p
+              style={{
+                margin: 0,
+                fontSize: 14,
+                color: "#c4b5fd",
+                lineHeight: 1.6,
+              }}
+            >
+              {card.back}
+            </p>
+          </div>
+        </div>
       </div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <button

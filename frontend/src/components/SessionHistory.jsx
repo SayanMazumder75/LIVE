@@ -74,11 +74,17 @@ export default function SessionHistory({
     }
   }, [listSessions]);
 
-  // Auto-refresh every time the drawer opens so the list reflects
-  // recent saves without a manual refresh click.
+  // Auto-refresh in two cases:
+  //   1. drawer opens — get the freshest list before the user reads it
+  //   2. a new live session_id appears (Start Translation just ran) —
+  //      so the count badge in the header bumps up immediately
+  //      without the user having to hit the Refresh button.
+  // Deletes are already handled inline by `handleDelete`, which both
+  // optimistically removes the row and re-runs `refresh` to reconcile
+  // with the server.
   useEffect(() => {
     if (open) refresh();
-  }, [open, refresh]);
+  }, [open, currentSessionId, refresh]);
 
   const handleOpen = useCallback(
     (session) => {
@@ -183,8 +189,28 @@ export default function SessionHistory({
           }}
         >
           <div>
-            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>
+            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600,
+              display: "flex", alignItems: "center", gap: 8 }}>
               Saved Sessions
+              {/* Live count badge — updates automatically via the
+                  refresh effects above whenever a session is added
+                  (new live recording) or deleted (trash icon). */}
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: "#67e8f9",
+                  background: "rgba(6,182,212,0.15)",
+                  border: "1px solid rgba(6,182,212,0.35)",
+                  borderRadius: 99,
+                  padding: "1px 9px",
+                  minWidth: 22,
+                  textAlign: "center",
+                }}
+                aria-label={`${sessions.length} saved sessions`}
+              >
+                {loading && sessions.length === 0 ? "…" : sessions.length}
+              </span>
             </h2>
             <p
               style={{
