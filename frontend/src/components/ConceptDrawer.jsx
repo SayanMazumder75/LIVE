@@ -13,6 +13,7 @@ import {
   Check,
   AlertTriangle,
 } from "lucide-react";
+import { DiagramView } from "./ConceptDiagrams.jsx";
 
 /**
  * ConceptDrawer
@@ -481,66 +482,6 @@ function SectionCard({ icon: Icon, title, color, children }) {
   );
 }
 
-/**
- * One pane of the Diagram section — either "Concept Structure" or
- * "Real Example". Both panes share the same monospace `<pre>`
- * styling so an ASCII tree on the left lines up visually with its
- * concrete-values counterpart on the right; only the small accent-
- * coloured label distinguishes them.
- *
- * Side-by-side layout is driven by the `auto-fit, minmax(260px,
- * 1fr)` grid in the parent — when the drawer is narrower than
- * ~540 px the second pane drops to its own row automatically, so
- * mobile / split-screen viewports stack the diagrams vertically
- * without needing a CSS media query.
- */
-function DiagramPanel({ label, body, accent }) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 6,
-        minWidth: 0,
-      }}
-    >
-      <span
-        style={{
-          fontSize: 10,
-          fontWeight: 700,
-          textTransform: "uppercase",
-          letterSpacing: "0.1em",
-          color: accent || "#94a3b8",
-        }}
-      >
-        {label}
-      </span>
-      <pre
-        style={{
-          margin: 0,
-          padding: "10px 12px",
-          background: "#0b1220",
-          border: `1px solid ${accent ? accent + "33" : "#1e293b"}`,
-          borderRadius: 8,
-          color: "#cbd5e1",
-          fontSize: 12,
-          lineHeight: 1.45,
-          overflowX: "auto",
-          // `pre-wrap` would collapse the careful spacing in ASCII
-          // trees / boxes; we keep `pre` and rely on overflowX:auto
-          // for narrow viewports.
-          whiteSpace: "pre",
-          fontFamily:
-            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-          flex: 1,
-        }}
-      >
-        {body}
-      </pre>
-    </div>
-  );
-}
-
 function ExplanationBody({ explanation }) {
   const e = explanation || {};
   const examQuestions = Array.isArray(e.examQuestions) ? e.examQuestions : [];
@@ -586,16 +527,16 @@ function ExplanationBody({ explanation }) {
             }}
           >
             {e.diagram ? (
-              <DiagramPanel
+              <DiagramView
                 label="Concept Structure"
-                body={e.diagram}
+                diagram={e.diagram}
                 accent="#a78bfa"
               />
             ) : null}
             {e.exampleDiagram ? (
-              <DiagramPanel
+              <DiagramView
                 label="Real Example"
-                body={e.exampleDiagram}
+                diagram={e.exampleDiagram}
                 accent="#22d3ee"
               />
             ) : null}
@@ -701,24 +642,127 @@ Return ONLY valid JSON (no markdown, no prose around it). Use this EXACT shape:
   "definition": "A clear, beginner-friendly definition in 2-4 sentences.",
   "whyNeeded": "Why this concept is needed / what problem it solves, in 2-4 sentences.",
   "realLifeExample": "A concrete relatable example, in 2-4 sentences. Avoid jargon.",
-  "diagram": "A CONCEPTUAL ASCII / text-based diagram showing the abstract structure with placeholder labels like 'Root', 'Node', 'Left', 'Right', 'Head', 'Front', 'Back'. Use newlines and indentation. Plain text only — no markdown, no code fences. Use empty string \"\" if the concept truly has no visual structure (e.g. an abstract algorithm with no data layout).",
-  "exampleDiagram": "A REAL EXAMPLE ASCII / text-based diagram showing how the same concept looks with CONCRETE realistic values (actual numbers, names, IDs, edge labels — no Node/Left/Right placeholders). Should be SIMPLER and SHORTER than 'diagram' so students immediately see how the structure appears in a real problem. Suggested sizes: 4-7 nodes for tree-like structures (AVL, BST, Heap, Trie, B-Tree, Red-Black), 4-6 nodes for graphs / network topologies, 3-5 entries for queues / stacks / linked lists / hash tables, 3-5 rows for tables / database relationships, 3-5 processes for OS scheduling. Plain text only. Use empty string \"\" only if a concrete example genuinely doesn't apply.",
+  "diagram": <DIAGRAM-OBJECT for the concept structure (see DIAGRAM SPEC below)>,
+  "exampleDiagram": <DIAGRAM-OBJECT for a real example with concrete values>,
   "examQuestions": ["short academic-style question 1", "...", "...", "..."],
   "interviewQuestions": ["short industry / behavioural question 1", "...", "...", "..."]
 }
 
-Concrete examples to follow (do NOT copy verbatim — generate fresh content for the concept below):
-- AVL Tree:        diagram uses Node/Left/Right with balance-factor labels; exampleDiagram has nodes like 30/20/40/10/50 with the balance factor under each subtree.
-- Binary Search Tree: diagram is Root/Left<Root/Right>Root; exampleDiagram has e.g. 50/30/70/20/40/60/80.
-- Stack:           diagram is | top |, | … |, | bottom |; exampleDiagram has | 7 ← top |, | 4 |, | 9 |, | 2 ← bottom |.
-- Queue:           diagram has Front → … → Back; exampleDiagram has Front: A → B → C → D :Back.
-- Linked List:     diagram is [data|next] → [data|next] → NULL; exampleDiagram is [3]→[7]→[12]→NULL.
-- Hash Table:      diagram is Index → Bucket; exampleDiagram has 0:[], 1:[Alice→Bob], 2:[], 3:[Carol], 4:[Dan].
-- Graph / Network: diagram is generic A—B—C with edges; exampleDiagram has named cities or routers e.g. Delhi—Mumbai—Pune with edge weights.
-- DB Relationships: diagram is Entity1—rel—Entity2; exampleDiagram is Users—has many—Orders—belongs to—Products with cardinalities (1:N, N:M).
-- OS Scheduling:   diagram is generic Process queue with priority slots; exampleDiagram has P1(2ms), P2(5ms), P3(1ms) and the order they run under FCFS / SJF / RR.
-
 Generate 3-5 exam questions and 3-5 interview questions.
+
+────────────────────────────────────────
+DIAGRAM SPEC
+────────────────────────────────────────
+A DIAGRAM-OBJECT is one of the following JSON shapes — pick whichever
+best fits the concept. Output STRUCTURED data, NOT ascii art (the
+frontend renders proper SVG from this). Always include a one-line
+"rule" string that captures the main teaching point.
+
+(a) Tree (Binary Tree, BST, AVL, Heap, Red-Black, B-Tree, Trie, etc.):
+{
+  "kind": "tree",
+  "root": {
+    "value": "Root",
+    "label": "optional sub-label, e.g. balance:0",
+    "left":  { "value": "Left",  "left": {...}, "right": {...} },
+    "right": { "value": "Right", "left": {...}, "right": {...} }
+  },
+  "rule": "Left < Parent < Right"
+}
+- For the CONCEPT STRUCTURE, use educational placeholder values:
+  "Root", "Left Child", "Right Child", "Leaf", "Internal Node", etc.,
+  so beginners learn the terminology.
+- For the REAL EXAMPLE, use concrete realistic numbers / strings.
+  Show 5-7 nodes total. Always include EVERY child (don't omit
+  the right subtree).
+
+(b) Linked List:
+{
+  "kind": "list",
+  "items": [{"value":"3"},{"value":"7"},{"value":"12"}],
+  "terminator": "NULL",
+  "rule": "Each node points to the next; tail points to NULL"
+}
+
+(c) Stack:
+{
+  "kind": "stack",
+  "items": [{"value":"7"},{"value":"4"},{"value":"9"},{"value":"2"}],   // index 0 is the TOP
+  "rule": "LIFO — last item pushed is first popped"
+}
+
+(d) Queue:
+{
+  "kind": "queue",
+  "items": [{"value":"A"},{"value":"B"},{"value":"C"}],   // index 0 is the FRONT
+  "rule": "FIFO — first item enqueued is first dequeued"
+}
+
+(e) Graph / Network Topology:
+{
+  "kind": "graph",
+  "nodes": [{"id":"A"},{"id":"B"},{"id":"C"},{"id":"D"}],
+  "edges": [
+    {"from":"A","to":"B","weight":"5"},
+    {"from":"B","to":"C","weight":"3"},
+    {"from":"C","to":"D"}
+  ],
+  "directed": false,
+  "rule": "Vertices V connected by edges E; edges may be weighted"
+}
+- Real example for graphs / networks should use named cities or
+  routers (e.g. "Delhi","Mumbai","Pune","Chennai") with edge weights.
+
+(f) Hash Table:
+{
+  "kind": "hashTable",
+  "buckets": [
+    {"index":0, "items":[]},
+    {"index":1, "items":[{"value":"Alice"},{"value":"Bob"}]},
+    {"index":2, "items":[]},
+    {"index":3, "items":[{"value":"Carol"}]}
+  ],
+  "rule": "hash(key) → bucket index; collisions chain in the bucket"
+}
+
+(g) ASCII fallback (only if NONE of the above fit):
+{
+  "kind": "ascii",
+  "text": "raw monospace diagram preserving all whitespace",
+  "rule": "..."
+}
+
+Both "diagram" and "exampleDiagram" MUST follow the same DIAGRAM SPEC.
+The CONCEPT STRUCTURE teaches terminology with educational labels;
+the REAL EXAMPLE teaches the same shape with simpler concrete values.
+Both should include their own short "rule" line.
+
+────────────────────────────────────────
+EXAMPLE diagram OBJECT for "Binary Search Tree":
+────────────────────────────────────────
+"diagram": {
+  "kind": "tree",
+  "root": {
+    "value": "Root",
+    "left":  { "value": "Left Child",  "left":{"value":"Leaf"}, "right":{"value":"Leaf"} },
+    "right": { "value": "Right Child", "left":{"value":"Leaf"}, "right":{"value":"Leaf"} }
+  },
+  "rule": "Each node has up to 2 children: left and right"
+},
+"exampleDiagram": {
+  "kind": "tree",
+  "root": {
+    "value": "50",
+    "left":  { "value": "30", "left": {"value":"20"}, "right": {"value":"40"} },
+    "right": { "value": "70", "left": {"value":"60"}, "right": {"value":"80"} }
+  },
+  "rule": "Left < Parent < Right"
+}
+────────────────────────────────────────
+
+CRITICAL: When a tree node has only ONE child in the example, you
+MUST omit the missing child key entirely (don't put null, don't put
+an empty object). The renderer treats missing keys as "no child".
 
 CONCEPT: "${concept.name}"
 ${concept.summary ? `SHORT SUMMARY: "${concept.summary}"` : ""}
