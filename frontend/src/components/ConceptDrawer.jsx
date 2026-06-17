@@ -28,7 +28,10 @@ import {
  *   - Definition          — clear, beginner-friendly what-it-is
  *   - Why Needed          — motivation / problem it solves
  *   - Real Life Example   — relatable concrete scenario
- *   - Diagram             — text/ASCII diagram (LLM output, no canvas)
+ *   - Diagram             — TWO panes side-by-side: a Concept Structure
+ *                           with placeholder labels AND a Real Example
+ *                           with concrete values. Stacks vertically on
+ *                           narrow viewports (mobile / split screen).
  *   - Exam Questions      — 3-5 academic-style questions
  *   - Interview Questions — 3-5 industry / behavioural prompts
  *
@@ -478,6 +481,66 @@ function SectionCard({ icon: Icon, title, color, children }) {
   );
 }
 
+/**
+ * One pane of the Diagram section — either "Concept Structure" or
+ * "Real Example". Both panes share the same monospace `<pre>`
+ * styling so an ASCII tree on the left lines up visually with its
+ * concrete-values counterpart on the right; only the small accent-
+ * coloured label distinguishes them.
+ *
+ * Side-by-side layout is driven by the `auto-fit, minmax(260px,
+ * 1fr)` grid in the parent — when the drawer is narrower than
+ * ~540 px the second pane drops to its own row automatically, so
+ * mobile / split-screen viewports stack the diagrams vertically
+ * without needing a CSS media query.
+ */
+function DiagramPanel({ label, body, accent }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+        minWidth: 0,
+      }}
+    >
+      <span
+        style={{
+          fontSize: 10,
+          fontWeight: 700,
+          textTransform: "uppercase",
+          letterSpacing: "0.1em",
+          color: accent || "#94a3b8",
+        }}
+      >
+        {label}
+      </span>
+      <pre
+        style={{
+          margin: 0,
+          padding: "10px 12px",
+          background: "#0b1220",
+          border: `1px solid ${accent ? accent + "33" : "#1e293b"}`,
+          borderRadius: 8,
+          color: "#cbd5e1",
+          fontSize: 12,
+          lineHeight: 1.45,
+          overflowX: "auto",
+          // `pre-wrap` would collapse the careful spacing in ASCII
+          // trees / boxes; we keep `pre` and rely on overflowX:auto
+          // for narrow viewports.
+          whiteSpace: "pre",
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+          flex: 1,
+        }}
+      >
+        {body}
+      </pre>
+    </div>
+  );
+}
+
 function ExplanationBody({ explanation }) {
   const e = explanation || {};
   const examQuestions = Array.isArray(e.examQuestions) ? e.examQuestions : [];
@@ -504,26 +567,39 @@ function ExplanationBody({ explanation }) {
         </SectionCard>
       ) : null}
 
-      {e.diagram ? (
+      {(e.diagram || e.exampleDiagram) ? (
         <SectionCard icon={Network} title="Diagram" color="#6366f1">
-          <pre
+          {/* Two-pane layout — Concept Structure on the left, Real
+              Example on the right.
+              `auto-fit, minmax(260px, 1fr)` is the magic that makes
+              this responsive WITHOUT a media query: as the drawer
+              narrows below ~540 px (e.g. on mobile or split-screen
+              desktop) the second column wraps to its own row, so the
+              diagrams stack vertically. Above ~540 px they sit
+              side-by-side. */}
+          <div
             style={{
-              margin: 0,
-              padding: "10px 12px",
-              background: "#0b1220",
-              border: "1px solid #1e293b",
-              borderRadius: 8,
-              color: "#cbd5e1",
-              fontSize: 12,
-              lineHeight: 1.45,
-              overflowX: "auto",
-              fontFamily:
-                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-              whiteSpace: "pre",
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+              gap: 12,
+              alignItems: "stretch",
             }}
           >
-            {e.diagram}
-          </pre>
+            {e.diagram ? (
+              <DiagramPanel
+                label="Concept Structure"
+                body={e.diagram}
+                accent="#a78bfa"
+              />
+            ) : null}
+            {e.exampleDiagram ? (
+              <DiagramPanel
+                label="Real Example"
+                body={e.exampleDiagram}
+                accent="#22d3ee"
+              />
+            ) : null}
+          </div>
         </SectionCard>
       ) : null}
 
@@ -625,10 +701,22 @@ Return ONLY valid JSON (no markdown, no prose around it). Use this EXACT shape:
   "definition": "A clear, beginner-friendly definition in 2-4 sentences.",
   "whyNeeded": "Why this concept is needed / what problem it solves, in 2-4 sentences.",
   "realLifeExample": "A concrete relatable example, in 2-4 sentences. Avoid jargon.",
-  "diagram": "A small ASCII / text-based diagram or labelled outline. Use newlines and indentation. Plain text only — no markdown, no code fences.",
+  "diagram": "A CONCEPTUAL ASCII / text-based diagram showing the abstract structure with placeholder labels like 'Root', 'Node', 'Left', 'Right', 'Head', 'Front', 'Back'. Use newlines and indentation. Plain text only — no markdown, no code fences. Use empty string \"\" if the concept truly has no visual structure (e.g. an abstract algorithm with no data layout).",
+  "exampleDiagram": "A REAL EXAMPLE ASCII / text-based diagram showing how the same concept looks with CONCRETE realistic values (actual numbers, names, IDs, edge labels — no Node/Left/Right placeholders). Should be SIMPLER and SHORTER than 'diagram' so students immediately see how the structure appears in a real problem. Suggested sizes: 4-7 nodes for tree-like structures (AVL, BST, Heap, Trie, B-Tree, Red-Black), 4-6 nodes for graphs / network topologies, 3-5 entries for queues / stacks / linked lists / hash tables, 3-5 rows for tables / database relationships, 3-5 processes for OS scheduling. Plain text only. Use empty string \"\" only if a concrete example genuinely doesn't apply.",
   "examQuestions": ["short academic-style question 1", "...", "...", "..."],
   "interviewQuestions": ["short industry / behavioural question 1", "...", "...", "..."]
 }
+
+Concrete examples to follow (do NOT copy verbatim — generate fresh content for the concept below):
+- AVL Tree:        diagram uses Node/Left/Right with balance-factor labels; exampleDiagram has nodes like 30/20/40/10/50 with the balance factor under each subtree.
+- Binary Search Tree: diagram is Root/Left<Root/Right>Root; exampleDiagram has e.g. 50/30/70/20/40/60/80.
+- Stack:           diagram is | top |, | … |, | bottom |; exampleDiagram has | 7 ← top |, | 4 |, | 9 |, | 2 ← bottom |.
+- Queue:           diagram has Front → … → Back; exampleDiagram has Front: A → B → C → D :Back.
+- Linked List:     diagram is [data|next] → [data|next] → NULL; exampleDiagram is [3]→[7]→[12]→NULL.
+- Hash Table:      diagram is Index → Bucket; exampleDiagram has 0:[], 1:[Alice→Bob], 2:[], 3:[Carol], 4:[Dan].
+- Graph / Network: diagram is generic A—B—C with edges; exampleDiagram has named cities or routers e.g. Delhi—Mumbai—Pune with edge weights.
+- DB Relationships: diagram is Entity1—rel—Entity2; exampleDiagram is Users—has many—Orders—belongs to—Products with cardinalities (1:N, N:M).
+- OS Scheduling:   diagram is generic Process queue with priority slots; exampleDiagram has P1(2ms), P2(5ms), P3(1ms) and the order they run under FCFS / SJF / RR.
 
 Generate 3-5 exam questions and 3-5 interview questions.
 
