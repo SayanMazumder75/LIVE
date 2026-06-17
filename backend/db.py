@@ -276,6 +276,26 @@ def _session_doc(session_id: str, user_id: Optional[str] = None) -> dict:
     return doc
 
 
+def _to_utc_aware(dt: datetime) -> datetime:
+    """
+    Re-attach UTC tzinfo to datetimes that motor read back as naive.
+
+    pymongo/motor return BSON datetimes as **naive** Python datetimes
+    by default (the wall-clock value is correctly in UTC, but
+    `tzinfo` is `None`). That's a footgun: `dt.isoformat()` on a
+    naive value omits the timezone, so the frontend's
+    `new Date(...)` parses it as the *browser's* local time and
+    every saved-session timestamp ends up shifted by the user's
+    UTC offset. Calling this helper before any serialization or
+    formatting of `createdAt` makes the value honest — UTC in,
+    UTC out — and the frontend's `toLocaleString()` then produces
+    the user's actual local time correctly.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _serialize_session(doc: dict) -> dict:
     """Return a JSON-safe copy of a session document."""
     if not doc:
@@ -288,8 +308,11 @@ def _serialize_session(doc: dict) -> dict:
     }
     created = doc.get("createdAt")
     if isinstance(created, datetime):
-        # ISO string is the most portable cross-language wire format.
-        out["createdAt"] = created.isoformat()
+        # ISO string with explicit UTC offset is the only portable
+        # cross-language format. Without the offset the browser
+        # silently parses it as local time and the displayed
+        # "saved at" clock ends up wrong by the user's UTC offset.
+        out["createdAt"] = _to_utc_aware(created).isoformat()
     elif created is not None:
         out["createdAt"] = str(created)
     user_id = doc.get("userId")
@@ -399,8 +422,15 @@ async def list_sessions(user_id: Optional[str] = None) -> list[dict]:
     async for doc in cursor:
         created = doc.get("createdAt")
         if isinstance(created, datetime):
-            created_iso = created.isoformat()
-            label_when = created.astimezone().strftime("%Y-%m-%d %H:%M")
+            # Re-attach UTC tzinfo (motor strips it) so the ISO
+            # string carries an offset and downstream code (the
+            # frontend, mostly) can parse it without guessing.
+            created_aware = _to_utc_aware(created)
+            created_iso = created_aware.isoformat()
+            # The label is a *fallback* for very old client builds
+            # that didn't know how to format `createdAt` themselves.
+            # Use UTC explicitly so it's at least unambiguous.
+            label_when = created_aware.strftime("%Y-%m-%d %H:%M UTC")
         else:
             created_iso = str(created) if created is not None else ""
             label_when = created_iso

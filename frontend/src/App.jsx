@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import TranscriptPanel from "./components/TranscriptPanel.jsx";
 import FloatingMicWidget from "./components/FloatingMicWidget.jsx";
-import SessionHistory from "./components/SessionHistory.jsx";
+import SessionHistory, { formatSessionLabel } from "./components/SessionHistory.jsx";
 import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
 import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
@@ -314,7 +314,14 @@ export default function App() {
         const finals = parseSavedTranscript(text, meta?.createdAt);
         setViewedSession({
           id: sessionId,
-          label: meta?.label || `Session ${sessionId}`,
+          // Always derive the displayed label from createdAt in the
+          // user's local timezone — the server's label is in UTC,
+          // which is wrong for everyone outside UTC.
+          label: formatSessionLabel({
+            id: sessionId,
+            createdAt: meta?.createdAt,
+            label: meta?.label,
+          }),
           createdAt: meta?.createdAt || null,
           rawText: text,
           finals,

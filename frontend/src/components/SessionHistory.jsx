@@ -2,6 +2,32 @@ import { useCallback, useEffect, useState } from "react";
 import { Trash2, Loader2 } from "lucide-react";
 
 /**
+ * Build a human-readable label for a saved session.
+ *
+ * Always derives the label from `createdAt` (an ISO string with UTC
+ * offset emitted by the backend) so it lands in the user's local
+ * timezone. Falls back to the server-supplied `label` for old client
+ * paths that might still have records without `createdAt`.
+ */
+function formatSessionLabel(session) {
+  if (session?.createdAt) {
+    const d = new Date(session.createdAt);
+    if (!Number.isNaN(d.getTime())) {
+      // 24-hour clock and ISO-style date, e.g. "Session 2026-06-17 11:34"
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mi = String(d.getMinutes()).padStart(2, "0");
+      return `Session ${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+    }
+  }
+  return session?.label || `Session ${session?.id}`;
+}
+
+export { formatSessionLabel };
+
+/**
  * SessionHistory
  * --------------
  * A right-side drawer that lists past sessions saved to MongoDB
@@ -109,7 +135,7 @@ export default function SessionHistory({
       if (!session?.id) return;
       if (!onDeleteSession) return;
 
-      const niceLabel = session.label || `Session ${session.id}`;
+      const niceLabel = formatSessionLabel(session);
       // window.confirm gives the OK/Cancel dialog the spec asked for —
       // native, accessible, blocks until the user answers. No third-
       // party modal needed.
@@ -370,7 +396,7 @@ export default function SessionHistory({
                         textOverflow: "ellipsis",
                       }}
                     >
-                      {s.label || `Session ${s.id}`}
+                      {formatSessionLabel(s)}
                       {isCurrent ? " · live" : ""}
                       {isViewed ? " · open" : ""}
                     </span>
@@ -393,7 +419,7 @@ export default function SessionHistory({
                       the row's main onClick from also firing. */}
                   <button
                     type="button"
-                    aria-label={`Delete ${s.label || s.id}`}
+                    aria-label={`Delete ${formatSessionLabel(s)}`}
                     title={
                       isCurrent
                         ? "This session is currently recording — deleting it is allowed but won't stop the recording"
