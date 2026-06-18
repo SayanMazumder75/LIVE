@@ -10,7 +10,11 @@ import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { parseSavedTranscript } from "./hooks/parseSavedTranscript.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
 
-const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
+const WS_URL =
+  import.meta.env.VITE_WS_URL ||
+  "ws://localhost:8001";
+
+const ws = new WebSocket(WS_URL);
 // Session persistence (MongoDB) — same shape as the old MeetMind
 // project's HTTP API. Override with VITE_HTTP_URL when the backend
 // HTTP server runs on a different host/port from localhost:8000.
