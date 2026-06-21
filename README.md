@@ -196,6 +196,80 @@ discarded immediately, so no video is recorded or sent anywhere.
   has limited support; Safari mostly doesn't support it.
 - **Hindi mode** requires the Web Speech API. **Chrome / Edge** support it
   with `hi-IN` natively; Firefox doesn't expose continuous recognition.
+- **Floating Mic Widget** (Document Picture-in-Picture) requires
+  **Chrome 116+ / Edge 116+**. The widget pops the mic controls into a
+  small always-on-top window so they stay visible while you watch a
+  video or attend a meeting in another tab.
+
+### Embedding inside MeetMind (or any host page)
+
+The AI Transcriber works fine when embedded in an `<iframe>`, with one
+caveat: **Document Picture-in-Picture cannot be opened from inside an
+iframe.** Chrome only allows `documentPictureInPicture.requestWindow()`
+from a top-level browsing context, so the floating mic widget would
+silently fail if it tried to open itself from the iframe.
+
+The fix is split across two parts:
+
+1. **Inside the iframe** (this app), `FloatingMicWidget.jsx` detects
+   that it's embedded and delegates to the parent via `postMessage`
+   instead of calling `requestWindow()` directly.
+
+2. **On the parent page** (e.g. MeetMind), include the drop-in host
+   script that ships with this project:
+
+   ```html
+   <iframe
+     src="https://ai-transcriber.example.com/"
+     allow="microphone; display-capture; picture-in-picture; clipboard-write"
+   ></iframe>
+
+   <!-- Optional: lock down which iframe origins can drive PiP. -->
+   <script>
+     window.MeetMindAITranscriberPiPConfig = {
+       allowedOrigins: ["https://ai-transcriber.example.com"],
+     };
+   </script>
+   <script src="https://ai-transcriber.example.com/meetmind-pip-host.js"></script>
+   ```
+
+   The host script is shipped from this repo at
+   `frontend/public/meetmind-pip-host.js` (so the production build
+   serves it at `/meetmind-pip-host.js`). It owns the call to
+   `documentPictureInPicture.requestWindow()`, paints a small widget
+   UI inside the new window, and proxies mic toggle / close events
+   back to the iframe so the audio pipeline keeps running there.
+
+   The script also exposes a tiny runtime API on
+   `window.MeetMindAITranscriberPiP` for the host page:
+
+   - `apiSupported` — boolean, true if the browser supports the API
+   - `hasActive()` — boolean, true while a PiP window is open
+   - `closeActive()` — programmatically close the active PiP window
+   - `setAllowedOrigins([...])` — update the allow-list at runtime
+
+3. **If the host page does NOT include the host script**, the
+   floating-mic-widget button in the iframe stays disabled and shows a
+   tooltip explaining that PiP is unavailable in embedded mode. Users
+   can still open AI Transcriber in its own tab to use the widget.
+
+The wire protocol between the iframe and the host script is documented
+in the JSDoc at the top of
+[`frontend/src/components/FloatingMicWidget.jsx`](frontend/src/components/FloatingMicWidget.jsx)
+and
+[`frontend/public/meetmind-pip-host.js`](frontend/public/meetmind-pip-host.js).
+To target a known parent origin from the iframe (recommended in
+production), set `VITE_PARENT_ORIGIN=https://meetmind.example.com`
+before `npm run build`.
+
+Required iframe `allow` attribute, in full:
+
+| Permission        | Why                                                |
+| ----------------- | -------------------------------------------------- |
+| `microphone`      | mic capture inside the iframe                      |
+| `display-capture` | tab/system audio via `getDisplayMedia`             |
+| `picture-in-picture` | propagates user activation for the parent's PiP open |
+| `clipboard-write` | optional, for "Copy transcript" if you add it later |
 
 ## How a session flows
 
