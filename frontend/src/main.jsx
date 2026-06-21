@@ -1,10 +1,19 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App.jsx";
+/**
+ * main.jsx — AI Transcriber (embedded in MeetMind)
+ *
+ * auth.js is imported FIRST, before React even renders App.
+ * This mirrors the exact Speech-to-Text pattern so the postMessage
+ * listener is registered as early as possible — MeetMind may fire
+ * the MEETMIND_AUTH message immediately after the iframe loads.
+ */
+import "./auth"; // ← must be first import, registers postMessage listener
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
 import "./index.css";
+import App from "./App.jsx";
 
-ReactDOM.createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
     <App />
-  </React.StrictMode>
+  </StrictMode>
 );

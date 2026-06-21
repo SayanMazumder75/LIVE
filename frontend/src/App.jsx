@@ -8,6 +8,7 @@ import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { parseSavedTranscript } from "./hooks/parseSavedTranscript.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
+import { isAuthenticated } from "./auth";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
 const HTTP_URL = import.meta.env.VITE_HTTP_URL || "http://localhost:8000";
@@ -55,7 +56,67 @@ function formatDuration(totalSeconds) {
   return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
 }
 
+// ── Auth gate — shown when no token received from MeetMind yet ───────────────
+function AuthRequired() {
+  return (
+    <div
+      className="min-h-screen w-full flex flex-col items-center justify-center"
+      style={{ backgroundColor: "#0f172a", color: "#ffffff" }}
+    >
+      <div
+        style={{
+          background: "rgba(30,41,59,0.8)",
+          border: "1px solid rgba(71,85,105,0.6)",
+          borderRadius: 16,
+          padding: "40px 48px",
+          textAlign: "center",
+          maxWidth: 420,
+        }}
+      >
+        <div
+          aria-hidden="true"
+          style={{
+            width: 56,
+            height: 56,
+            borderRadius: "50%",
+            background: "rgba(99,102,241,0.15)",
+            border: "1px solid rgba(99,102,241,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            margin: "0 auto 20px",
+            fontSize: 24,
+          }}
+        >
+          🔒
+        </div>
+        <h2
+          style={{
+            fontSize: "1.25rem",
+            fontWeight: 600,
+            marginBottom: 10,
+            color: "#e2e8f0",
+          }}
+        >
+          Authentication Required
+        </h2>
+        <p style={{ color: "#94a3b8", fontSize: "0.95rem", lineHeight: 1.6 }}>
+          Please login through MeetMind.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  // ── Auth gate — FIRST thing inside App(), before any other hooks ─────────
+  // isAuthenticated() reads from memory / localStorage — safe to call here.
+  // React rules are satisfied: no hooks are called conditionally below this;
+  // all useState/useRef/etc. declarations come AFTER this early-return guard.
+  if (!isAuthenticated()) {
+    return <AuthRequired />;
+  }
+
   const [language, setLanguage] = useState("en");
 
   const sysSocket = useTranscriptSocket(WS_URL);
@@ -266,10 +327,6 @@ export default function App() {
     micSocket.stopSession,
   ]);
 
-  // ── mic toggle (FloatingMicWidget removed — plain fixed button now) ────
-  // Same logic as before: flips mic on/off via useMixedAudio's
-  // enableMic/disableMic, and starts/stops the mic's own AAI session.
-  // No PiP, no portal, no "close widget" callback — just a toggle.
   const handleToggleMic = useCallback(async () => {
     if (micActive) {
       await disableMic();
@@ -558,8 +615,6 @@ export default function App() {
     ? `Saved Meeting · ${viewedSession.label}`
     : panelSubtitle;
 
-  // Mic status line shown next to the fixed button — mirrors what
-  // the old PiP widget's WidgetContent used to say.
   const micStatusLine = (() => {
     if (!wsConnected) return "Reconnecting…";
     if (!translating) return "Translation not started";
@@ -728,12 +783,6 @@ export default function App() {
                   Start Translation
                 </button>
               )}
-
-              {/* ── Fixed mic button (replaces FloatingMicWidget) ──────────
-                  Same toggle logic as before (handleToggleMic), same
-                  disabled-when-not-translating rule, same status text.
-                  No PiP window, no portal — just a plain button that
-                  sits inline with the other controls. */}
               <button
                 type="button"
                 onClick={handleToggleMic}
@@ -754,8 +803,6 @@ export default function App() {
           ) : null}
         </div>
 
-        {/* Mic status line — shown under the controls row, mirrors
-            what the old PiP widget displayed inside its window. */}
         {!isViewing && translating ? (
           <p
             className={`text-xs -mt-2 ${
@@ -793,10 +840,10 @@ export default function App() {
             <span className="font-medium text-slate-200">
               Audio recording is off.
             </span>{" "}
-            {persistence.recordingReason} Set
-            {" "}<code className="text-slate-100">CLOUDINARY_*</code> in
-            {" "}<code className="text-slate-100">backend/.env</code> and
-            restart the backend to enable session recordings.
+            {persistence.recordingReason} Set{" "}
+            <code className="text-slate-100">CLOUDINARY_*</code> in{" "}
+            <code className="text-slate-100">backend/.env</code> and restart
+            the backend to enable session recordings.
           </div>
         ) : null}
 
@@ -833,7 +880,8 @@ export default function App() {
 
         {!isViewing && translating && isHindi ? (
           <div className="px-4 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">
-            Captions appear about every {HINDI_CHUNK_MS / 1000} seconds (Whisper batches Hindi audio in chunks).
+            Captions appear about every {HINDI_CHUNK_MS / 1000} seconds (Whisper
+            batches Hindi audio in chunks).
           </div>
         ) : null}
 
@@ -930,9 +978,9 @@ function RecordingCard({ audioUrl, audioDuration, sessionLabel, sessionId }) {
       <div className="px-4 py-3 rounded-md bg-slate-800/60 border border-slate-700 text-slate-400 text-xs flex items-center gap-2">
         <Mic size={14} aria-hidden="true" className="opacity-60" />
         <span>
-          No audio recording was saved for this session. (Either it
-          was created before recording was enabled, or Cloudinary was
-          not configured at the time.)
+          No audio recording was saved for this session. (Either it was created
+          before recording was enabled, or Cloudinary was not configured at the
+          time.)
         </span>
       </div>
     );
@@ -1018,10 +1066,7 @@ function RecordingCard({ audioUrl, audioDuration, sessionLabel, sessionId }) {
         >
           {downloading ? (
             <>
-              <Loader2
-                size={13}
-                style={{ animation: "spin 1s linear infinite" }}
-              />
+              <Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} />
               Preparing…
             </>
           ) : (
@@ -1037,10 +1082,7 @@ function RecordingCard({ audioUrl, audioDuration, sessionLabel, sessionId }) {
         controls
         src={audioUrl}
         preload="metadata"
-        style={{
-          width: "100%",
-          colorScheme: "dark",
-        }}
+        style={{ width: "100%", colorScheme: "dark" }}
       />
 
       {downloadError ? (
@@ -1067,32 +1109,13 @@ function UploadStatusBadge({ status, message }) {
   if (!status) return null;
   const palette =
     status === "uploaded"
-      ? {
-          bg: "rgba(74,222,128,0.1)",
-          border: "rgba(74,222,128,0.3)",
-          color: "#4ade80",
-          icon: "●",
-        }
+      ? { bg: "rgba(74,222,128,0.1)", border: "rgba(74,222,128,0.3)", color: "#4ade80", icon: "●" }
       : status === "uploading"
-      ? {
-          bg: "rgba(6,182,212,0.1)",
-          border: "rgba(6,182,212,0.35)",
-          color: "#67e8f9",
-          icon: <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} />,
-        }
+      ? { bg: "rgba(6,182,212,0.1)", border: "rgba(6,182,212,0.35)", color: "#67e8f9",
+          icon: <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> }
       : status === "error"
-      ? {
-          bg: "rgba(239,68,68,0.1)",
-          border: "rgba(239,68,68,0.3)",
-          color: "#fca5a5",
-          icon: "✗",
-        }
-      : {
-          bg: "rgba(148,163,184,0.1)",
-          border: "rgba(148,163,184,0.25)",
-          color: "#cbd5e1",
-          icon: "•",
-        };
+      ? { bg: "rgba(239,68,68,0.1)", border: "rgba(239,68,68,0.3)", color: "#fca5a5", icon: "✗" }
+      : { bg: "rgba(148,163,184,0.1)", border: "rgba(148,163,184,0.25)", color: "#cbd5e1", icon: "•" };
 
   return (
     <div
