@@ -6,7 +6,7 @@
  * listener is registered as early as possible — MeetMind may fire
  * the MEETMIND_AUTH message immediately after the iframe loads.
  */
-import "./auth"; // ← must be first import, registers postMessage listener
+import Auth from "./Auth.jsx"; // must import before App to register postMessage listener
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
