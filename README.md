@@ -267,3 +267,69 @@ like *"Translation: Groq rate limit reached…"*. Options:
 Hindi recognition itself doesn't go through Groq, so transcripts keep
 flowing in Devanagari even when translations are paused — only the English
 under each line is missing.
+
+
+## Authentication — SSO bridge from MeetMind
+
+AI Transcriber doesn't host its own login page. When it's embedded
+inside MeetMind, the parent page forwards the JWT it received from the
+SSO provider down to the iframe via `postMessage`. The iframe stores
+the token in memory + `localStorage` and attaches it to every backend
+request as `Authorization: Bearer <jwt>`. **The History UI is gated on
+this token** — saved sessions only appear once a token has been
+received. Live transcription itself runs without auth.
+
+The contract is intentionally identical to the
+[speech-to-text repo](https://github.com/SayanMazumder75/speechtotext),
+so a single MeetMind broadcast authenticates both apps simultaneously.
+
+### How the parent broadcasts the token
+
+On the MeetMind page, after it has the JWT, post it down to each
+embedded AI Transcriber iframe:
+
+```js
+// MeetMind side — send to every AI Transcriber iframe currently embedded.
+function sendAuthToTranscriber(iframe, token) {
+  iframe.contentWindow.postMessage(
+    { type: "MEETMIND_AUTH", token },
+    "https://ai-transcriber.example.com" // exact iframe origin
+  );
+}
+```
+
+Things to know:
+
+- **`MEETMIND_AUTH`** is the only message type the bridge listens for.
+- The iframe enforces **strict origin checking** against
+  `VITE_MEETMIND_ORIGIN` (set at build time). Any postMessage from a
+  different origin is silently dropped.
+- The token is stored under `localStorage["live_auth_token"]` (a
+  separate key from speech-to-text's `stt_auth_token`) so a 401 in
+  one app doesn't sign the user out of the other. Both apps still
+  receive the same MEETMIND_AUTH broadcast in real time.
+- On a backend `401`, the bridge clears the cached token, the History
+  button auto-disables, and the History drawer auto-closes — MeetMind
+  can then re-broadcast a fresh token without us caching the stale
+  one.
+- The token survives a hard reload of the iframe (read back from
+  `localStorage` before MeetMind has a chance to re-broadcast).
+
+### Configuration
+
+Per environment, set `VITE_MEETMIND_ORIGIN` in
+`frontend/.env.local`:
+
+```
+# Production
+VITE_MEETMIND_ORIGIN=https://meetmind.vercel.app
+
+# Local development (Next.js default)
+VITE_MEETMIND_ORIGIN=http://localhost:3000
+```
+
+See [`frontend/.env.example`](frontend/.env.example) for the full set
+of variables. The SSO bridge implementation is in
+[`frontend/src/auth.js`](frontend/src/auth.js); the React-side gating
+uses [`frontend/src/hooks/useAuth.js`](frontend/src/hooks/useAuth.js)
+and lives in [`frontend/src/App.jsx`](frontend/src/App.jsx).

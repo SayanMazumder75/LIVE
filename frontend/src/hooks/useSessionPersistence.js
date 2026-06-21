@@ -1,4 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getToken, clearToken } from "../auth.js";
+
+/**
+ * Build the standard request headers. Adds `Authorization: Bearer
+ * <jwt>` when the SSO bridge has a token, otherwise sends the
+ * request unauthenticated (the LIVE backend doesn't yet enforce
+ * auth, but sending the header when we have it lines up exactly with
+ * the speech-to-text contract).
+ *
+ * `extra` lets callers add `Content-Type` etc. without losing the
+ * Bearer header.
+ */
+function authHeaders(extra) {
+  const headers = { ...(extra || {}) };
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
 
 /**
  * useSessionPersistence
@@ -72,9 +90,15 @@ export function useSessionPersistence(httpUrl) {
       const url = `${baseUrl}${path}`;
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body || {}),
       });
+      if (res.status === 401) {
+        // Token expired or invalid — drop it so the UI flips back to
+        // signed-out and MeetMind can re-broadcast a fresh one.
+        clearToken();
+        return null;
+      }
       if (res.status === 503) {
         // Backend says persistence is disabled. Try to capture the
         // classified reason ('Authentication failed', 'IP not allowed',
@@ -103,7 +127,11 @@ export function useSessionPersistence(httpUrl) {
   const _get = useCallback(
     async (path) => {
       const url = `${baseUrl}${path}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: authHeaders() });
+      if (res.status === 401) {
+        clearToken();
+        return null;
+      }
       if (res.status === 503) {
         let reason = "";
         try {
@@ -134,7 +162,7 @@ export function useSessionPersistence(httpUrl) {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(`${baseUrl}/`);
+        const res = await fetch(`${baseUrl}/`, { headers: authHeaders() });
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
@@ -431,8 +459,20 @@ export function useSessionPersistence(httpUrl) {
       try {
         const res = await fetch(`${baseUrl}/upload-audio`, {
           method: "POST",
+          // Don't set Content-Type — the browser must add the
+          // multipart boundary itself. authHeaders() only contributes
+          // the Bearer token here.
+          headers: authHeaders(),
           body: form,
         });
+        if (res.status === 401) {
+          clearToken();
+          return {
+            ok: false,
+            reason: "auth",
+            message: "Authentication required to upload recordings.",
+          };
+        }
         if (res.status === 503) {
           let reason = "";
           try {
@@ -496,7 +536,18 @@ export function useSessionPersistence(httpUrl) {
       }
       try {
         const url = `${baseUrl}/transcript/${encodeURIComponent(sid)}`;
-        const res = await fetch(url, { method: "DELETE" });
+        const res = await fetch(url, {
+          method: "DELETE",
+          headers: authHeaders(),
+        });
+        if (res.status === 401) {
+          clearToken();
+          return {
+            ok: false,
+            reason: "auth",
+            message: "Authentication required to delete sessions.",
+          };
+        }
         if (res.status === 503) {
           let reason = "";
           try {

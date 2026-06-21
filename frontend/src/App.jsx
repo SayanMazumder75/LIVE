@@ -7,6 +7,7 @@ import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
 import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { parseSavedTranscript } from "./hooks/parseSavedTranscript.js";
+import { useAuth } from "./hooks/useAuth.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
@@ -63,6 +64,20 @@ export default function App() {
 
   const persistence = useSessionPersistence(HTTP_URL);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // Auth state from the SSO bridge (auth.js + postMessage from
+  // MeetMind). The History UI is gated on this — only authenticated
+  // users see saved sessions, in line with the speech-to-text repo's
+  // contract. Live transcription itself runs without auth.
+  const { isAuthenticated } = useAuth();
+
+  // If the token is cleared while the drawer is open (e.g. backend
+  // returned 401 mid-session), close the drawer so the user isn't
+  // staring at a list they can no longer refresh or click into.
+  useEffect(() => {
+    if (!isAuthenticated && historyOpen) {
+      setHistoryOpen(false);
+    }
+  }, [isAuthenticated, historyOpen]);
   const [viewedSession, setViewedSession] = useState(null);
   const [viewedLoading, setViewedLoading] = useState(false);
   const [viewedError, setViewedError] = useState("");
@@ -604,15 +619,23 @@ export default function App() {
           <button
             type="button"
             onClick={() => setHistoryOpen(true)}
+            disabled={!isAuthenticated}
             title={
-              persistence.persistenceEnabled
+              !isAuthenticated
+                ? "Sign in via MeetMind to view session history"
+                : persistence.persistenceEnabled
                 ? "Browse saved sessions"
                 : "Backend has no MONGO_URI — sessions are not being saved"
             }
-            className="px-3 py-1.5 rounded-md text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 transition-colors"
+            className={
+              "px-3 py-1.5 rounded-md text-sm font-medium border transition-colors " +
+              (isAuthenticated
+                ? "bg-slate-800 hover:bg-slate-700 border-slate-600 text-slate-200"
+                : "bg-slate-900 border-slate-700 text-slate-500 cursor-not-allowed")
+            }
           >
             History
-            {persistence.sessionId ? (
+            {isAuthenticated && persistence.sessionId ? (
               <span className="ml-1.5 text-xs text-emerald-400">●</span>
             ) : null}
           </button>
@@ -637,13 +660,15 @@ export default function App() {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
-                onClick={() => setHistoryOpen(true)}
-                className="px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200"
-              >
-                Open another
-              </button>
+              {isAuthenticated ? (
+                <button
+                  type="button"
+                  onClick={() => setHistoryOpen(true)}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200"
+                >
+                  Open another
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={handleBackToLive}
