@@ -1,0 +1,54 @@
+[33mcommit 39ce6db97658d86ba9b75d90e6ce027ecac23fd8[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mfeat/auth-gate-history[m[33m, [m[1;31morigin/feat/auth-gate-history[m[33m)[m
+Author: Kiro Agent <244629292+kiro-agent@users.noreply.github.com>
+Date:   Sun Jun 21 05:31:36 2026 +0000
+
+    Decouple auth from MeetMind: rename MEETMIND_ORIGIN -> AUTH_ORIGIN
+    
+    Follow-up to PR #28. The user clarified that LIVE's tokens
+    DON'T come from MeetMind — they come from whichever parent issues
+    tokens to MeetMind too. So 'MeetMind' was the wrong word in three
+    places: the env var, the const, and the user-facing copy. The SSO
+    LOGIC stays identical to speech-to-text, but the wiring is now
+    parent-agnostic.
+    
+    What changed
+    - VITE_AUTH_ORIGIN is now the primary env var. VITE_MEETMIND_ORIGIN
+      remains as a back-compat fallback so any Render/Vercel configs
+      that already set it keep working without re-deploys.
+    - Default origin changed from 'https://meetmind.vercel.app' to ''.
+      An unconfigured production build now stays unauthenticated rather
+      than silently trusting a third party. The strict origin check
+      rejects every postMessage when AUTH_ORIGIN is empty.
+    - The postMessage listener is no longer attached at all when
+      AUTH_ORIGIN is empty — saves a no-op listener on every message
+      that flies past the window in development. A dev-only
+      console.info hint tells the engineer how to fix it.
+    - All user-visible 'MeetMind' strings replaced with parent-agnostic
+      copy:
+        'Sign in via MeetMind to view your saved meetings' -> 'Sign in
+        to view your saved meetings'
+        placeholder body 'Open the LIVE Translator from inside MeetMind'
+        -> 'Open this app from your authenticated host'
+    - The literal postMessage type string 'MEETMIND_AUTH' is preserved
+      as the discriminator. That keeps LIVE drop-in compatible with the
+      same parent that already speaks the speech-to-text contract — only
+      the parent's domain needs to be configured per app.
+    - New exported helper getAuthOrigin() so the UI can show the
+      configured origin in tooltips/diagnostics if useful later.
+    
+    What stayed
+    - Comments referencing 'MeetMind' that describe the historical
+      origin of the persistence code (port of the old MeetMind server.js)
+      are factually correct and preserved.
+    - The MEETMIND_AUTH message-type literal is preserved for
+      cross-app contract compatibility.
+    - All four authFetch wiring + the SignInPlaceholder card unchanged
+      in behaviour.
+    
+    Build clean: 251 kB JS / 77 kB gzipped — no size change.
+
+ frontend/src/App.jsx                       |  11 [32m+[m[31m--[m
+ frontend/src/auth.js                       | 115 [32m++++++++++++++++++++[m[31m---------[m
+ frontend/src/components/SessionHistory.jsx |  15 [32m++[m[31m--[m
+ frontend/src/hooks/useAuthToken.js         |   2 [32m+[m[31m-[m
+ 4 files changed, 96 insertions(+), 47 deletions(-)

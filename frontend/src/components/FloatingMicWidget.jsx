@@ -7,10 +7,18 @@ import { createPortal } from "react-dom";
  * switches to another tab (a YouTube video, a Meet call, etc.) — which
  * is the whole point of Mic+System mode.
  *
- * Browser support: Chrome 116+ / Edge 116+ (Document PiP API). On
- * unsupported browsers the trigger button is disabled with a tooltip;
- * the rest of the app keeps working with mic stuck off (system audio
- * still gets transcribed).
+ * Browser support: Chrome 116+ / Edge 116+ (Document PiP API).
+ *
+ * IFRAME FIX: Document Picture-in-Picture's requestWindow() throws
+ * NotAllowedError when called from inside an iframe — it's a browser
+ * security restriction, only top-level browsing contexts may open a
+ * PiP window. This app is currently embedded as an iframe inside
+ * MeetMind, so `supported` now also checks `window.top === window`
+ * (i.e. "am I the top-level page, not someone's iframe"). When the
+ * app IS framed, the trigger button is disabled with a clear tooltip
+ * instead of throwing on click — the rest of the app (mic toggle,
+ * system audio, transcripts) keeps working normally; only the
+ * floating-window convenience is unavailable while embedded.
  *
  * Props:
  *   micActive          : boolean — current mic state (driven by App)
@@ -41,8 +49,26 @@ export default function FloatingMicWidget({
   wsConnected,
   micError,
 }) {
-  const supported =
+  // IFRAME FIX: detect whether we're running inside an iframe. The
+  // try/catch guards against cross-origin frame access throwing on
+  // `window.top` in some browsers — if that throws, we're definitely
+  // framed (same-origin frames never throw here).
+  const isTopLevel = (() => {
+    try {
+      return window.top === window.self;
+    } catch {
+      return false;
+    }
+  })();
+
+  const pipApiPresent =
     typeof window !== "undefined" && "documentPictureInPicture" in window;
+
+  // Only "supported" when the PiP API exists AND we're not inside an
+  // iframe — calling requestWindow() while framed throws
+  // NotAllowedError every time, so we treat that combination as
+  // unsupported up front instead of letting the click handler fail.
+  const supported = pipApiPresent && isTopLevel;
 
   const [pipWindow, setPipWindow] = useState(null);
   const onCloseRef = useRef(onClose);
@@ -93,8 +119,19 @@ export default function FloatingMicWidget({
 
       setPipWindow(w);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[mic-widget] failed to open PiP:", e);
+      // IFRAME FIX: NotAllowedError from inside an iframe is expected
+      // and not worth alarming the console about at error-level;
+      // anything else is logged as a real failure.
+      if (e?.name === "NotAllowedError") {
+        // eslint-disable-next-line no-console
+        console.info(
+          "[mic-widget] PiP unavailable in this embed context (iframe):",
+          e.message
+        );
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn("[mic-widget] failed to open PiP:", e);
+      }
     }
   }, [supported, pipWindow]);
 
@@ -127,6 +164,14 @@ export default function FloatingMicWidget({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // IFRAME FIX: distinct tooltip when the API exists but we're
+  // framed, vs. when the browser simply doesn't support PiP at all.
+  const unsupportedReason = !pipApiPresent
+    ? "Document Picture-in-Picture not supported. Use Chrome 116+ or Edge 116+."
+    : !isTopLevel
+    ? "Floating widget is unavailable while embedded in another page. Open this app directly in its own tab to use it."
+    : "";
+
   return (
     <>
       <button
@@ -135,7 +180,7 @@ export default function FloatingMicWidget({
         disabled={!supported}
         title={
           !supported
-            ? "Document Picture-in-Picture not supported. Use Chrome 116+ or Edge 116+."
+            ? unsupportedReason
             : pipWindow
             ? "Close the floating mic widget"
             : "Open the floating mic widget — stays on top of other tabs/windows"

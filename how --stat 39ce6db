@@ -1,0 +1,92 @@
+[33mcommit d44954b14b13c041beeedeff60624e25b96dae3e[m
+Author: Kiro Agent <244629292+kiro-agent@users.noreply.github.com>
+Date:   Sun Jun 21 05:17:12 2026 +0000
+
+    Port speech-to-text JWT auth: gate History on token + auto-attach Bearer
+    
+    Mirrors the SSO pattern from the speech-to-text repo:
+      parent (MeetMind) postMessage "MEETMIND_AUTH" → child stores JWT
+      in memory + localStorage → every API call carries
+      Authorization: Bearer <token> automatically.
+    
+    When no token is held, the Saved Sessions drawer renders a sign-in
+    placeholder instead of the list. Live transcription, AI Insights,
+    the concept drawer, and full-session recording all keep working
+    unauthenticated — only the saved-history list is gated, exactly
+    the way speech-to-text gates its history.
+    
+    Files
+    - frontend/src/auth.js (new) — port of speech-to-text auth.js with
+      three additions for the LIVE codebase:
+        1. fetch-based authFetch() helper (LIVE uses fetch, not axios),
+        2. subscribe()/notify pattern so React components can re-render
+           on token change without prop drilling,
+        3. dev-only window.__liveAuth handle (tree-shaken in prod) so
+           you can flip auth state from DevTools without a reload.
+    - frontend/src/hooks/useAuthToken.js (new) — useSyncExternalStore
+      subscription to the auth.js singleton, returns the current token
+      with concurrent-mode-safe snapshot semantics.
+    - frontend/src/main.jsx — imports auth.js as the FIRST import so
+      the postMessage listener is registered on window before any
+      React render. Without this ordering, a MEETMIND_AUTH message
+      arriving during the first frame can be dropped, leaving the
+      user permanently unauthenticated until they reload.
+    - frontend/src/hooks/useSessionPersistence.js — every protected
+      endpoint (POST /start-session, /push, /insights, /upload-audio,
+      GET /transcripts, GET /transcript/:id, DELETE /transcript/:id)
+      goes through authFetch instead of fetch. Public GET / health
+      probe stays on plain fetch by design (it returns server
+      diagnostics that should be visible to all visitors).
+    - frontend/src/components/SessionHistory.jsx — new
+      isAuthenticated prop. When false:
+        * count badge shows 🔒 instead of N,
+        * Refresh button is disabled,
+        * subtitle reads "Sign in to view your saved meetings.",
+        * a SignInPlaceholder card replaces the entire list (rather
+          than rendering an empty/error state) and explains how to
+          authenticate via MeetMind.
+      When true the drawer behaves exactly as before. The list is
+      also cleared when authentication is dropped, so a logged-out
+      user can never glimpse cached entries from a previous session.
+    - frontend/src/App.jsx — uses useAuthToken() to derive
+      isAuthenticated, prefixes the History header button with 🔒
+      when locked, threads isAuthenticated into <SessionHistory/>.
+      Updated tooltip explains why the button is locked.
+    
+    Env var
+      VITE_MEETMIND_ORIGIN — exact origin of the MeetMind parent
+                              window (no trailing slash). Defaults to
+                              https://meetmind.vercel.app. The strict
+                              equality check rejects any postMessage
+                              coming from any other origin, even if it
+                              contains a valid-looking token payload.
+    
+    Backend unchanged
+    The HTTP API doesn't currently verify the JWT (out of scope for
+    this PR — the user only asked for the FRONTEND gate). The
+    Authorization header is sent on every protected request anyway,
+    so the backend can start verifying it later without another
+    frontend roll-out.
+    
+    Local-dev workflow
+    Without a real MeetMind to send a postMessage, you can flip the
+    state from DevTools:
+    
+      // dev-only console handle
+      __liveAuth.setToken("dev-token")
+      __liveAuth.clearToken()
+    
+      // works in prod too via raw localStorage
+      localStorage.setItem("live_auth_token", "dev-token")
+      location.reload()
+    
+    Build clean: 251 kB JS / 77 kB gzipped (+ ~1 kB for auth + hook +
+    SignInPlaceholder).
+
+ frontend/src/App.jsx                        |  17 [32m++[m[31m-[m
+ frontend/src/auth.js                        | 194 [32m+++++++++++++++++++++++++[m
+ frontend/src/components/SessionHistory.jsx  | 211 [32m+++++++++++++++++++++++[m[31m-----[m
+ frontend/src/hooks/useAuthToken.js          |  29 [32m++++[m
+ frontend/src/hooks/useSessionPersistence.js |  18 [32m++[m[31m-[m
+ frontend/src/main.jsx                       |   7 [32m+[m
+ 6 files changed, 432 insertions(+), 44 deletions(-)
