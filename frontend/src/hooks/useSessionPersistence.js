@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-
+import { getToken } from "../auth.js";
 /**
  * useSessionPersistence
  * ---------------------
@@ -70,11 +70,18 @@ export function useSessionPersistence(httpUrl) {
   const _post = useCallback(
     async (path, body) => {
       const url = `${baseUrl}${path}`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body || {}),
-      });
+      const token = getToken();
+
+const res = await fetch(url, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    ...(token
+      ? { Authorization: `Bearer ${token}` }
+      : {}),
+  },
+  body: JSON.stringify(body || {}),
+});
       if (res.status === 503) {
         // Backend says persistence is disabled. Try to capture the
         // classified reason ('Authentication failed', 'IP not allowed',
@@ -103,7 +110,15 @@ export function useSessionPersistence(httpUrl) {
   const _get = useCallback(
     async (path) => {
       const url = `${baseUrl}${path}`;
-      const res = await fetch(url);
+      const token = getToken();
+
+const res = await fetch(url, {
+  headers: token
+    ? {
+        Authorization: `Bearer ${token}`,
+      }
+    : {},
+});
       if (res.status === 503) {
         let reason = "";
         try {
@@ -429,10 +444,17 @@ export function useSessionPersistence(httpUrl) {
       form.append("audio", file, filename);
 
       try {
-        const res = await fetch(`${baseUrl}/upload-audio`, {
-          method: "POST",
-          body: form,
-        });
+        const token = getToken();
+
+const res = await fetch(`${baseUrl}/upload-audio`, {
+  method: "POST",
+  headers: token
+    ? {
+        Authorization: `Bearer ${token}`,
+      }
+    : {},
+  body: form,
+});
         if (res.status === 503) {
           let reason = "";
           try {
@@ -496,7 +518,16 @@ export function useSessionPersistence(httpUrl) {
       }
       try {
         const url = `${baseUrl}/transcript/${encodeURIComponent(sid)}`;
-        const res = await fetch(url, { method: "DELETE" });
+        const token = getToken();
+
+const res = await fetch(url, {
+  method: "DELETE",
+  headers: token
+    ? {
+        Authorization: `Bearer ${token}`,
+      }
+    : {},
+});
         if (res.status === 503) {
           let reason = "";
           try {
