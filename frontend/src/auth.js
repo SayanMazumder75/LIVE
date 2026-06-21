@@ -1,8 +1,9 @@
 /**
  * auth.js — LIVE Translator Frontend
  *
- * Same SSO bridge pattern used by the standalone speech-to-text app:
- * a parent window (MeetMind) hands us a JWT via window.postMessage,
+ * Same SSO bridge pattern speech-to-text uses, decoupled from any
+ * specific parent application. A trusted parent window (whichever
+ * app issues your tokens) hands us a JWT via window.postMessage,
  * we keep it in memory + localStorage, and every API request that
  * goes through `authFetch()` automatically attaches it as
  * `Authorization: Bearer <token>`.
@@ -11,28 +12,34 @@
  * ---------------------------------------------
  * `main.jsx` imports this module BEFORE rendering the React tree, so
  * the postMessage listener is registered on `window` before any
- * `<App/>` mount can race with an incoming MEETMIND_AUTH message.
- * Without that ordering a token sent during the very first frame
- * could be silently dropped.
+ * `<App/>` mount can race with an incoming auth message. Without
+ * that ordering a token sent during the very first frame could be
+ * silently dropped.
  *
- * SSO contract (matches speech-to-text byte-for-byte)
- * ---------------------------------------------------
- *     Parent (MeetMind) does:
+ * SSO contract
+ * ------------
+ *     Parent (whichever app issues your tokens) does:
  *         iframeRef.contentWindow.postMessage(
  *             { type: "MEETMIND_AUTH", token: "<jwt>" },
  *             "<this app's origin>"
  *         );
  *
  *     We accept the message ONLY when:
- *         - event.origin === MEETMIND_ORIGIN  (strict equality, no wildcards)
+ *         - event.origin === AUTH_ORIGIN   (strict equality, no wildcards)
  *         - event.data.type === "MEETMIND_AUTH"
  *         - event.data.token is a non-empty string
  *
+ *     The literal string "MEETMIND_AUTH" is preserved as the
+ *     message-type discriminator so this module is drop-in
+ *     compatible with the same parent that sends tokens to the
+ *     speech-to-text app — the only thing you have to change is
+ *     pointing AUTH_ORIGIN at YOUR parent's domain.
+ *
  *     On successful receipt we cache the token, persist it, and
- *     notify any React subscribers so the UI can flip from
+ *     notify any React subscribers so the UI flips from
  *     "sign-in required" to "history visible" in real time.
  *
- * Local development without MeetMind
+ * Local development without a parent
  * ----------------------------------
  * To unblock testing while running standalone, drop a token into
  * localStorage from DevTools:
@@ -44,11 +51,28 @@
  * — see the dev-only attachment at the bottom of this file.
  */
 
-// ⚠️ Set this to your exact MeetMind frontend origin (no trailing slash).
-// Override per environment via VITE_MEETMIND_ORIGIN in frontend/.env.
-const MEETMIND_ORIGIN =
-  import.meta.env.VITE_MEETMIND_ORIGIN || "https://meetmind.vercel.app";
+// ⚠️ Set this to the EXACT origin of whichever parent window will
+// post auth tokens to LIVE — the same source that issues tokens to
+// your other apps (e.g. speech-to-text). Strict equality, no
+// trailing slash, no wildcards.
+//
+// Configure via VITE_AUTH_ORIGIN. The legacy VITE_MEETMIND_ORIGIN
+// name still works for backward compatibility with any deploy
+// configs that already use it.
+//
+// Default is the empty string, which makes the strict-equality
+// origin check fail for every incoming message — i.e. auth stays
+// completely off until the env var is configured. That's
+// deliberate: an unconfigured production build should never
+// silently accept tokens from any random parent.
+const AUTH_ORIGIN =
+  import.meta.env.VITE_AUTH_ORIGIN ||
+  import.meta.env.VITE_MEETMIND_ORIGIN ||
+  "";
 
+// localStorage key. Distinct from speech-to-text's "stt_auth_token"
+// so the two apps can coexist on the same browser without stomping
+// each other's tokens.
 const LS_KEY = "live_auth_token";
 
 // In-memory cache so we don't hit localStorage on every request.
@@ -72,23 +96,37 @@ try {
 
 // ── postMessage listener (the actual SSO bridge) ─────────────────────────
 if (typeof window !== "undefined") {
-  window.addEventListener("message", (event) => {
-    // Strict origin check — reject anything not from MeetMind.
-    if (event.origin !== MEETMIND_ORIGIN) return;
+  // Without a configured SSO origin, skip wiring the listener
+  // entirely. Otherwise an empty-string AUTH_ORIGIN would still
+  // attach (and harmlessly reject every message), which is just
+  // wasted work + noisy in stack traces during development.
+  if (AUTH_ORIGIN) {
+    window.addEventListener("message", (event) => {
+      // Strict origin check — reject anything not from the
+      // configured SSO host. This is the entire security boundary;
+      // never relax it (no wildcards, no `*`, no startsWith()).
+      if (event.origin !== AUTH_ORIGIN) return;
 
-    if (
-      event.data &&
-      event.data.type === "MEETMIND_AUTH" &&
-      typeof event.data.token === "string" &&
-      event.data.token.length > 0
-    ) {
-      _setToken(event.data.token);
-      // Surface in the dev console so deploying engineers can
-      // verify the handshake worked without rebuilding the app.
-      // eslint-disable-next-line no-console
-      console.log("[LIVE] Auth token received from MeetMind.");
-    }
-  });
+      if (
+        event.data &&
+        event.data.type === "MEETMIND_AUTH" &&
+        typeof event.data.token === "string" &&
+        event.data.token.length > 0
+      ) {
+        _setToken(event.data.token);
+        // Surface in the dev console so deploying engineers can
+        // verify the handshake worked without rebuilding the app.
+        // eslint-disable-next-line no-console
+        console.log(`[LIVE] Auth token received from ${AUTH_ORIGIN}.`);
+      }
+    });
+  } else if (import.meta.env.DEV) {
+    // eslint-disable-next-line no-console
+    console.info(
+      "[LIVE] VITE_AUTH_ORIGIN is not set; postMessage SSO is disabled. " +
+        "Set it to your auth host's origin to enable the saved-history view."
+    );
+  }
 }
 
 // ── internal mutator + subscriber notification ───────────────────────────
@@ -179,6 +217,16 @@ export async function authFetch(input, init = {}) {
   return res;
 }
 
+/**
+ * The configured SSO origin. Exposed read-only so UI components
+ * can reflect "you'll be signed in once you open this app from
+ * https://your-host.example.com" without hardcoding the value
+ * in two places.
+ */
+export function getAuthOrigin() {
+  return AUTH_ORIGIN;
+}
+
 // ── dev-only convenience handle ──────────────────────────────────────────
 // Lets you flip auth state from DevTools without reloading the page,
 // which is the difference between testing this feature in 3 seconds
@@ -190,5 +238,6 @@ if (import.meta.env.DEV && typeof window !== "undefined") {
     clearToken,
     getToken,
     isAuthenticated,
+    getAuthOrigin,
   };
 }

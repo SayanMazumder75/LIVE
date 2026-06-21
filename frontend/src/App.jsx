@@ -82,10 +82,11 @@ export default function App() {
   // Authentication state. The token itself comes from auth.js via the
   // postMessage SSO bridge; useAuthToken subscribes so the UI flips
   // from "Sign in to view your saved meetings" to the actual list
-  // the moment MeetMind hands us a JWT (or, on a fresh page load,
-  // when the previously-stored token is rehydrated from
-  // localStorage). `isAuthenticated` is the only piece App needs to
-  // make decisions; the token itself never leaves auth.js / authFetch.
+  // the moment the configured SSO host hands us a JWT (or, on a
+  // fresh page load, when the previously-stored token is rehydrated
+  // from localStorage). `isAuthenticated` is the only piece App
+  // needs to make decisions; the token itself never leaves auth.js
+  // / authFetch.
   const authToken = useAuthToken();
   const isAuthenticated = Boolean(authToken);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -766,7 +767,7 @@ export default function App() {
             onClick={() => setHistoryOpen(true)}
             title={
               !isAuthenticated
-                ? "Sign in via MeetMind to view your saved meetings"
+                ? "Sign in to view your saved meetings"
                 : persistence.persistenceEnabled
                 ? "Browse saved sessions"
                 : "Backend has no MONGO_URI — sessions are not being saved"

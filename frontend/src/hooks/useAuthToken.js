@@ -7,7 +7,7 @@ import { getToken, subscribe } from "../auth.js";
  * React subscription to the auth.js token store.
  *
  * Returns the current JWT (or null) and re-renders the component
- * whenever the token changes — most importantly, when MeetMind
+ * whenever the token changes — most importantly, when the SSO host
  * sends a fresh token via postMessage AFTER the React tree has
  * already mounted. Without this hook the History UI would only
  * notice a token change on the next user interaction.

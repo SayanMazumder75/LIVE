@@ -282,7 +282,7 @@ export default function SessionHistory({
               disabled={loading || !isAuthenticated}
               title={
                 !isAuthenticated
-                  ? "Sign in via MeetMind to load your saved sessions"
+                  ? "Sign in to load your saved sessions"
                   : "Reload the list from the server"
               }
               style={{
@@ -530,15 +530,14 @@ export default function SessionHistory({
  * The user gets:
  *   - a clear lock + heading explaining what's gated and why,
  *   - a one-line note about how to obtain a token (postMessage SSO
- *     from MeetMind), so the empty state is informative rather
- *     than just "you can't see this".
+ *     from whichever parent issues your tokens), so the empty
+ *     state is informative rather than just "you can't see this".
  *
  * Implementation note: this component is intentionally pure and
  * stateless — it knows nothing about how to actually log the user
  * in. That's by design. The auth flow itself is owned by auth.js
- * and the parent MeetMind window; the drawer just reflects the
- * current state of the singleton store via the isAuthenticated
- * prop.
+ * and the parent SSO host; the drawer just reflects the current
+ * state of the singleton store via the isAuthenticated prop.
  */
 function SignInPlaceholder() {
   return (
@@ -591,8 +590,8 @@ function SignInPlaceholder() {
         }}
       >
         Your saved transcripts, AI insights, and meeting recordings
-        are private. Open the LIVE Translator from inside MeetMind —
-        it sends a signed token via secure postMessage and your
+        are private. Open this app from your authenticated host —
+        a signed token arrives via secure postMessage and your
         history will appear here automatically.
       </p>
       <p
