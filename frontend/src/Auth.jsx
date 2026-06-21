@@ -1,10 +1,9 @@
 /**
  * auth.js — AI Transcriber (embedded in MeetMind)
  *
- * Exact same architecture as the Speech-to-Text project's auth.js.
  * Receives JWT from MeetMind via postMessage (SSO bridge).
  * Stores token in memory + localStorage for page refresh survival.
- * Exports getToken() used by all API/WS calls in App.jsx.
+ * Exports getToken() used by Axios interceptor in main.jsx / App.jsx
  *
  * SETUP: import this file early in main.jsx BEFORE App renders:
  *   import "./auth";
@@ -14,10 +13,9 @@
 // Examples:
 //   "https://meetmind.vercel.app"
 //   "http://localhost:3000"
-const MEETMIND_ORIGIN =
-  import.meta.env.VITE_MEETMIND_ORIGIN || "https://meetmind.vercel.app";
+const MEETMIND_ORIGIN = import.meta.env.VITE_MEETMIND_ORIGIN || "https://meetmind.vercel.app";
 
-const LS_KEY = "transcriber_auth_token"; // different key from stt_auth_token to avoid collisions
+const LS_KEY = "transcriber_auth_token"; // different key from stt_auth_token — avoids collision
 
 let authToken = null;
 
@@ -48,7 +46,7 @@ window.addEventListener("message", (event) => {
 
 /**
  * Returns current JWT token.
- * Used wherever an Authorization header is needed.
+ * Used by Axios interceptor to attach Authorization header.
  */
 export const getToken = () => {
   if (authToken) return authToken;
@@ -71,6 +69,6 @@ export const clearToken = () => {
 
 /**
  * True only when a token is present.
- * App.jsx renders the "Please login through MeetMind" gate on false.
+ * Used by App.jsx for the auth gate.
  */
 export const isAuthenticated = () => Boolean(getToken());

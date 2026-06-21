@@ -1,19 +1,52 @@
 /**
  * main.jsx — AI Transcriber (embedded in MeetMind)
  *
- * auth.js is imported FIRST, before React even renders App.
- * This mirrors the exact Speech-to-Text pattern so the postMessage
- * listener is registered as early as possible — MeetMind may fire
- * the MEETMIND_AUTH message immediately after the iframe loads.
+ * Imports auth.js FIRST to register postMessage listener before any renders.
+ * Sets up global Axios interceptor that auto-attaches Bearer token.
  */
-import Auth from "./Auth.jsx"; // must import before App to register postMessage listener
-import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-import "./index.css";
-import App from "./App.jsx";
 
-createRoot(document.getElementById("root")).render(
-  <StrictMode>
+import "./auth"; // ← MUST be first import — registers postMessage listener
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import axios from "axios";
+import { getToken, clearToken } from "./auth";
+import App from "./App.jsx";
+import "./index.css";
+
+// ── Global Axios Interceptor ──────────────────────────────────────────────────
+// Attaches Authorization: Bearer <token> to every outgoing request automatically.
+// No need to manually add headers in any API call throughout the app.
+
+axios.interceptors.request.use(
+  (config) => {
+    const token = getToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// ── Response Interceptor — handle 401 ────────────────────────────────────────
+// If token expired or invalid, clear it so user gets re-authenticated.
+
+axios.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      console.warn("[Transcriber] 401 received — token invalid or expired. Clearing.");
+      clearToken();
+    }
+    return Promise.reject(error);
+  }
+);
+
+// ── Mount App ─────────────────────────────────────────────────────────────────
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
     <App />
-  </StrictMode>
+  </React.StrictMode>
 );
