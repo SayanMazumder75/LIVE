@@ -8,7 +8,7 @@ import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { parseSavedTranscript } from "./hooks/parseSavedTranscript.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
-import { isAuthenticated } from "./auth";
+import { isAuthenticated } from "./auth.jsx";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
 const HTTP_URL = import.meta.env.VITE_HTTP_URL || "http://localhost:8000";

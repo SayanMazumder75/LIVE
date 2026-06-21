@@ -5,12 +5,12 @@
  * Sets up global Axios interceptor that auto-attaches Bearer token.
  */
 
-import "./auth"; // ← MUST be first import — registers postMessage listener
+import "./auth.jsx"; // ← MUST be first import — registers postMessage listener
 
 import React from "react";
 import ReactDOM from "react-dom/client";
 import axios from "axios";
-import { getToken, clearToken } from "./auth";
+import { getToken, clearToken } from "./auth.jsx";
 import App from "./App.jsx";
 import "./index.css";
 
