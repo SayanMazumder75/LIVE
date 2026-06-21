@@ -13,7 +13,7 @@
 // Examples:
 //   "https://meetmind.vercel.app"
 //   "http://localhost:3000"
-const MEETMIND_ORIGIN = import.meta.env.VITE_MEETMIND_ORIGIN || "https://meetmind.vercel.app";
+const MEETMIND_ORIGIN = import.meta.env.VITE_MEETMIND_ORIGIN || "http://localhost:5173";
 
 const LS_KEY = "transcriber_auth_token"; // different key from stt_auth_token — avoids collision
 
