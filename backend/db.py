@@ -9,7 +9,7 @@ working exactly as before:
 
     sessionSchema = {
         session_id    : String, required, unique
-        userId        : String, optional   (kept for migration safety)
+        userId        : String, required   (set on every new session)
         text          : String, default ""
         audioUrl      : String, default ""
         audioDuration : Number, default 0
@@ -50,12 +50,9 @@ class MongoNotConfigured(RuntimeError):
 
 # ── module-level singletons (set by start_db) ────────────────────────────────
 _client: Any = None  # motor.motor_asyncio.AsyncIOMotorClient | None
-_db: Any = None  # motor.motor_asyncio.AsyncIOMotorDatabase | None
+_db: Any = None      # motor.motor_asyncio.AsyncIOMotorDatabase | None
 _sessions: Any = None  # collection handle
 
-# Last connect attempt diagnostics — surfaced to the browser via the
-# 503 responses and `GET /` so users can see *why* persistence is off
-# without having to scrape backend logs.
 _last_error: str = ""
 _uri_was_set: bool = False
 _db_name: str = ""
@@ -67,16 +64,10 @@ def is_enabled() -> bool:
 
 
 def connection_error() -> str:
-    """Return the last MongoDB connection error message, or ''."""
     return _last_error
 
 
 def diagnostics() -> dict:
-    """
-    Snapshot of the persistence layer's current state, safe to expose
-    over HTTP. The URI itself is never returned — only whether it was
-    set and the database name we ended up using.
-    """
     return {
         "enabled": is_enabled(),
         "mongo_uri_set": _uri_was_set,
@@ -86,14 +77,6 @@ def diagnostics() -> dict:
 
 
 def _classify_error(exc: Exception) -> str:
-    """
-    Turn motor / pymongo exceptions into a single human-friendly line
-    that points at the most likely fix. We pattern-match on the
-    exception text because importing pymongo error classes here would
-    create a hard dependency just for the message — pymongo is already
-    pulled in by motor but we still want this module importable
-    without it.
-    """
     msg = str(exc) or exc.__class__.__name__
     low = msg.lower()
     name = exc.__class__.__name__
@@ -132,13 +115,8 @@ def _classify_error(exc: Exception) -> str:
 
 async def start_db() -> None:
     """
-    Connect to MongoDB once at process startup. Mirrors the
-    `mongoose.connect(process.env.MONGO_URI)` block in the old
-    server.js, including the same "connected" / "error" log lines.
-
-    Never raises. If MONGO_URI is missing the persistence layer is
-    simply disabled — every route that needs it returns 503 with a
-    clear message, but the WebSocket transcription path keeps working.
+    Connect to MongoDB once at process startup.
+    Never raises — persistence is simply disabled if MONGO_URI is missing.
     """
     global _client, _db, _sessions, _last_error, _uri_was_set, _db_name
 
@@ -147,38 +125,26 @@ async def start_db() -> None:
     if not uri:
         _last_error = "MONGO_URI is not set in backend/.env"
         logger.warning(
-            "MONGO_URI is not set; session persistence is disabled. Set "
-            "MONGO_URI in backend/.env to enable /start-session, /push, "
-            "/transcripts, and /transcript/:session_id."
+            "MONGO_URI is not set; session persistence is disabled."
         )
         return
 
-    # Log a redacted form of the URI so the user can confirm dotenv
-    # loaded the value they expect *without* leaking credentials.
     logger.info("MONGO_URI loaded: %s", _redact_uri(uri))
 
     try:
-        # Imported lazily so a missing motor install only breaks the
-        # persistence layer, not the WebSocket server.
         from motor.motor_asyncio import AsyncIOMotorClient
     except ImportError:
         _last_error = (
             "`motor` is not installed. Run `pip install motor` "
             "(or `pip install -r backend/requirements.txt`) and restart."
         )
-        logger.warning(
-            "MONGO_URI is set but `motor` is not installed — session "
-            "persistence is disabled. Run `pip install motor`."
-        )
+        logger.warning("MONGO_URI is set but `motor` is not installed.")
         return
 
     db_name_env = os.getenv("MONGO_DB", "").strip() or None
 
     try:
         client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
-        # Force the driver to actually open a connection now so the
-        # log line below is honest (mongoose's `.then(() => log)` does
-        # the same thing).
         await client.admin.command("ping")
     except Exception as e:  # noqa: BLE001
         _last_error = _classify_error(e)
@@ -188,22 +154,15 @@ async def start_db() -> None:
     if db_name_env:
         db = client[db_name_env]
     else:
-        # If the URI embeds a default database use it; otherwise fall
-        # back to "meetmind" so old-project records remain accessible
-        # without an explicit MONGO_DB override.
         db = client.get_default_database(default="meetmind")
 
     sessions = db["sessions"]
 
-    # `session_id` is unique in the old schema — keep that invariant.
-    # If the index already exists with the same shape this is a no-op.
     try:
         await sessions.create_index("session_id", unique=True)
         await sessions.create_index("createdAt")
         await sessions.create_index("userId")
     except Exception as e:  # noqa: BLE001
-        # Don't fail startup just because an index couldn't be created;
-        # log it and keep going.
         logger.warning("Could not ensure session indexes: %s", e)
 
     _client = client
@@ -215,9 +174,7 @@ async def start_db() -> None:
 
 
 def _redact_uri(uri: str) -> str:
-    """Hide the password in a Mongo connection string for safe logging."""
     try:
-        # mongodb+srv://USER:PASS@host/db?... -> mongodb+srv://USER:***@host/db?...
         scheme, rest = uri.split("://", 1)
         if "@" in rest:
             creds, hostpart = rest.split("@", 1)
@@ -231,7 +188,6 @@ def _redact_uri(uri: str) -> str:
 
 
 async def close_db() -> None:
-    """Close the Mongo client cleanly on shutdown."""
     global _client, _db, _sessions
     client = _client
     _client = None
@@ -254,50 +210,29 @@ def _require_sessions():
 
 
 # ── Session "schema" helpers ──────────────────────────────────────────────────
-#
-# motor doesn't have a Mongoose-style schema layer, so we centralise the
-# document shape here. Every write goes through `_session_doc()` /
-# `_serialize_session()` so the on-disk format stays identical to what
-# the old project produced — meaning records written by either project
-# can be read by the other.
 
-
-def _session_doc(session_id: str, user_id: Optional[str] = None) -> dict:
-    """Build a fresh session document with default field values."""
-    doc: dict = {
+def _session_doc(session_id: str, user_id: str) -> dict:
+    """
+    Build a fresh session document. userId is now required — every
+    session created through the authenticated API has an owner.
+    """
+    return {
         "session_id": session_id,
+        "userId": user_id,
         "text": "",
         "audioUrl": "",
         "audioDuration": 0,
         "createdAt": datetime.now(timezone.utc),
     }
-    if user_id:
-        doc["userId"] = user_id
-    return doc
 
 
 def _to_utc_aware(dt: datetime) -> datetime:
-    """
-    Re-attach UTC tzinfo to datetimes that motor read back as naive.
-
-    pymongo/motor return BSON datetimes as **naive** Python datetimes
-    by default (the wall-clock value is correctly in UTC, but
-    `tzinfo` is `None`). That's a footgun: `dt.isoformat()` on a
-    naive value omits the timezone, so the frontend's
-    `new Date(...)` parses it as the *browser's* local time and
-    every saved-session timestamp ends up shifted by the user's
-    UTC offset. Calling this helper before any serialization or
-    formatting of `createdAt` makes the value honest — UTC in,
-    UTC out — and the frontend's `toLocaleString()` then produces
-    the user's actual local time correctly.
-    """
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
 
 def _serialize_session(doc: dict) -> dict:
-    """Return a JSON-safe copy of a session document."""
     if not doc:
         return {}
     out = {
@@ -308,46 +243,32 @@ def _serialize_session(doc: dict) -> dict:
     }
     created = doc.get("createdAt")
     if isinstance(created, datetime):
-        # ISO string with explicit UTC offset is the only portable
-        # cross-language format. Without the offset the browser
-        # silently parses it as local time and the displayed
-        # "saved at" clock ends up wrong by the user's UTC offset.
         out["createdAt"] = _to_utc_aware(created).isoformat()
     elif created is not None:
         out["createdAt"] = str(created)
     user_id = doc.get("userId")
     if user_id:
         out["userId"] = user_id
-    # AI Meeting Intelligence lives on the same document — see
-    # save_insights() below. Only include the field if it's been set,
-    # so old session records (transcript-only) still serialize cleanly.
     if "insights" in doc and doc["insights"] is not None:
         out["insights"] = doc["insights"]
     return out
 
 
-# ── CRUD operations used by the HTTP routes ──────────────────────────────────
-#
-# Every method here is the Python translation of the matching block in
-# the old server.js — same field names, same defaults, same ordering.
+# ── CRUD operations ───────────────────────────────────────────────────────────
 
-
-async def create_session(
-    session_id: str, user_id: Optional[str] = None
-) -> dict:
+async def create_session(session_id: str, user_id: str) -> dict:
     """
-    Equivalent of `await Session.create({ session_id, userId })`.
+    Create a new session owned by `user_id`.
 
-    Returns the serialized session. Raises `ValueError` on duplicate
-    session_id so the HTTP layer can map it to a 409.
+    Unlike the old schema where userId was optional, every session
+    created by the authenticated API must have an owner. Raises
+    ValueError on duplicate session_id (→ HTTP 409).
     """
     sessions = _require_sessions()
-    doc = _session_doc(session_id, user_id=user_id)
+    doc = _session_doc(session_id, user_id)
     try:
         await sessions.insert_one(doc)
     except Exception as e:  # noqa: BLE001
-        # motor raises pymongo.errors.DuplicateKeyError; catch by
-        # message to avoid a hard import dependency on pymongo.
         if "duplicate key" in str(e).lower() or "E11000" in str(e):
             raise ValueError(f"Session '{session_id}' already exists") from e
         raise
@@ -355,31 +276,50 @@ async def create_session(
 
 
 async def find_session(session_id: str) -> Optional[dict]:
-    """Equivalent of `Session.findOne({ session_id })`."""
+    """
+    Load a session document by session_id with NO ownership check.
+    Internal use only (e.g. to confirm existence before a Cloudinary
+    upload). All public-facing routes must use find_session_for_user().
+    """
     sessions = _require_sessions()
     doc = await sessions.find_one({"session_id": session_id})
     return _serialize_session(doc) if doc else None
 
 
-async def append_text(session_id: str, line: str) -> bool:
+async def find_session_for_user(
+    session_id: str, user_id: str
+) -> Optional[dict]:
     """
-    Equivalent of:
-        const session = await Session.findOne({ session_id });
-        if (!session) return 404;
-        await Session.findOneAndUpdate(
-            { session_id },
-            { text: session.text + line + "\n" }
-        );
+    Load a session document only when it belongs to `user_id`.
 
-    The old code did read-modify-write; we do the same atomically with
-    `$set` after the read so concurrent appends from the same session
-    don't clobber each other in practice. Returns True if the session
-    existed (and was updated), False if it didn't exist.
+    The query is a hard equality check — { session_id, userId: user_id }.
+    Old records that have no userId field or a different userId are
+    treated as non-existent from the caller's perspective (returns None),
+    so they are never exposed through the API regardless of the
+    session_id being guessed correctly.
+
+    This is the ownership-safe replacement for find_session() in all
+    HTTP route handlers.
     """
     sessions = _require_sessions()
-    # Use $concat in a pipeline update so simultaneous /push calls from
-    # mic + system sockets append cleanly without the race that the old
-    # JS read-then-write had.
+    doc = await sessions.find_one(
+        {"session_id": session_id, "userId": user_id}
+    )
+    return _serialize_session(doc) if doc else None
+
+
+async def append_text(session_id: str, line: str) -> bool:
+    """
+    Atomically append `line + "\\n"` to the session's text field.
+
+    NOTE: callers are responsible for verifying ownership with
+    find_session_for_user() before calling this — this helper does
+    not re-check userId so it can be shared between authenticated
+    routes and any future internal/admin paths.
+
+    Returns True if the session existed (and was updated).
+    """
+    sessions = _require_sessions()
     result = await sessions.update_one(
         {"session_id": session_id},
         [
@@ -399,37 +339,29 @@ async def append_text(session_id: str, line: str) -> bool:
     return result.matched_count > 0
 
 
-async def list_sessions(user_id: Optional[str] = None) -> list[dict]:
+async def list_sessions(user_id: str) -> list[dict]:
     """
-    Equivalent of:
-        Session.find({ userId })
-               .sort({ createdAt: -1 })
-               .select("session_id createdAt")
+    Return session metadata for sessions owned by `user_id`, newest
+    first.
 
-    When `user_id` is None we return *all* sessions (useful for the
-    Live Translator project, which doesn't currently have auth — same
-    behaviour as old-project legacy records that have no userId).
+    The query is a strict equality match on userId — old records
+    without a userId field are never returned, so a new user cannot
+    accidentally inherit orphaned data.
     """
     sessions = _require_sessions()
-    query: dict = {}
-    if user_id:
-        query["userId"] = user_id
     cursor = (
-        sessions.find(query, {"session_id": 1, "createdAt": 1})
+        sessions.find(
+            {"userId": user_id},
+            {"session_id": 1, "createdAt": 1},
+        )
         .sort("createdAt", -1)
     )
     out: list[dict] = []
     async for doc in cursor:
         created = doc.get("createdAt")
         if isinstance(created, datetime):
-            # Re-attach UTC tzinfo (motor strips it) so the ISO
-            # string carries an offset and downstream code (the
-            # frontend, mostly) can parse it without guessing.
             created_aware = _to_utc_aware(created)
             created_iso = created_aware.isoformat()
-            # The label is a *fallback* for very old client builds
-            # that didn't know how to format `createdAt` themselves.
-            # Use UTC explicitly so it's at least unambiguous.
             label_when = created_aware.strftime("%Y-%m-%d %H:%M UTC")
         else:
             created_iso = str(created) if created is not None else ""
@@ -445,11 +377,7 @@ async def list_sessions(user_id: Optional[str] = None) -> list[dict]:
 
 
 async def get_transcript(session_id: str) -> Optional[str]:
-    """
-    Equivalent of `Session.findOne({ session_id })` followed by
-    returning `{ text: session.text }`. Returns None when the session
-    does not exist.
-    """
+    """Internal helper — no ownership check. Prefer get_session_full."""
     sessions = _require_sessions()
     doc = await sessions.find_one({"session_id": session_id}, {"text": 1})
     if not doc:
@@ -457,25 +385,23 @@ async def get_transcript(session_id: str) -> Optional[str]:
     return doc.get("text", "") or ""
 
 
+async def get_session_full(session_id: str) -> Optional[dict]:
+    """
+    Load the entire session document with NO ownership check.
+    Internal use only. Public routes use find_session_for_user().
+    """
+    sessions = _require_sessions()
+    doc = await sessions.find_one({"session_id": session_id})
+    if not doc:
+        return None
+    return _serialize_session(doc)
+
+
 async def save_insights(session_id: str, insights: dict) -> bool:
     """
-    Persist AI Meeting Intelligence into the EXISTING session document.
-
-    Per the project requirement, all generated intelligence (summary,
-    keyPoints, actionItems, topics, timeline, flashcards, quiz, and
-    the studyVault metadata) lives on the same record as the
-    transcript — there is intentionally no separate `vault`,
-    `meeting_intelligence`, `quiz`, or `flashcards` collection. A
-    single session document holds the entire meeting.
-
-    Implementation: one atomic `$set` of the whole `insights` subtree
-    so a re-save (e.g. user regenerated and clicked Save again)
-    cleanly overwrites the previous snapshot rather than merging
-    stale fields with new ones.
-
-    Returns True when the session existed and was updated, False when
-    no document with that session_id was found (so the HTTP layer can
-    map it to a 404 — same shape as POST /push).
+    Persist AI Meeting Intelligence into the existing session document.
+    Ownership must be verified by the caller before invoking this.
+    Returns True if the session existed and was updated.
     """
     sessions = _require_sessions()
     result = await sessions.update_one(
@@ -485,45 +411,13 @@ async def save_insights(session_id: str, insights: dict) -> bool:
     return result.matched_count > 0
 
 
-async def get_session_full(session_id: str) -> Optional[dict]:
-    """
-    Load the entire session document (transcript text + insights) so a
-    single query returns everything the client needs to rehydrate a
-    saved meeting. Returns None when no document with that session_id
-    exists.
-    """
-    sessions = _require_sessions()
-    doc = await sessions.find_one({"session_id": session_id})
-    if not doc:
-        return None
-    return _serialize_session(doc)
-
-
-async def get_session_full(session_id: str) -> Optional[dict]:
-    """
-    Load the entire session document (transcript text + insights) so a
-    single query returns everything the client needs to rehydrate a
-    saved meeting. Returns None when no document with that session_id
-    exists.
-    """
-    sessions = _require_sessions()
-    doc = await sessions.find_one({"session_id": session_id})
-    if not doc:
-        return None
-    return _serialize_session(doc)
-
-
 async def update_audio(
     session_id: str, audio_url: str, audio_duration: int
 ) -> bool:
     """
-    Persist the post-session audio recording's URL + duration onto the
-    EXISTING session document. The same single-document-per-meeting
-    rule as transcript and insights — no separate `recordings`
-    collection.
-
-    Returns True if the session existed and was updated, False if no
-    record with that session_id was found.
+    Persist audio recording URL + duration onto the existing session.
+    Ownership must be verified by the caller before invoking this.
+    Returns True if the session existed and was updated.
     """
     sessions = _require_sessions()
     result = await sessions.update_one(
@@ -540,17 +434,8 @@ async def update_audio(
 
 async def delete_session(session_id: str) -> bool:
     """
-    Remove a session document from MongoDB.
-
-    The whole record (transcript text + insights subtree + audio
-    metadata) lives in a single document by design, so a single
-    `delete_one` is enough — no fan-out across `vault` /
-    `meeting_intelligence` / `quiz` / `flashcards` collections,
-    because those collections don't exist in this project.
-
-    Returns True if a document was actually removed, False if no
-    session with that id existed (so the HTTP layer can map it to a
-    404 — same shape as POST /push).
+    Remove a session document. Ownership must be verified by the caller.
+    Returns True if a document was removed.
     """
     sessions = _require_sessions()
     result = await sessions.delete_one({"session_id": session_id})

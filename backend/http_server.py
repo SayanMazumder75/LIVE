@@ -1,27 +1,27 @@
 """
 HTTP REST server for session persistence.
 
-This is the Python equivalent of the four routes the old MeetMind
-project's `server.js` exposed for transcript storage:
+Auth model
+----------
+Every session-related endpoint now requires a valid MeetMind JWT:
 
-    POST /start-session            -> create session, return session_id
-    POST /push                     -> append a finalized line of text
-    GET  /transcripts              -> list saved sessions (newest first)
-    GET  /transcript/:session_id   -> load one saved session
+    Authorization: Bearer <token>
 
-Auth was JWT-protected in the old project because MeetMind needed
-multi-user SSO. The Live Translator project doesn't have user accounts
-yet, so we drop the `protect` middleware and store sessions without
-`userId`. The schema still tolerates a `userId` field, so old-project
-records with one are readable.
+The token is verified by auth.require_auth(), which mirrors the old
+MeetMind Node.js `protect` middleware.  On success it returns the
+caller's user_id (decoded["id"]).  On failure it raises HTTP 401.
 
-We use **aiohttp** because the rest of the backend is pure asyncio and
-already running an event loop for the WebSocket server. aiohttp can
-share that loop without needing a separate worker process the way
-uvicorn would.
+Ownership invariant
+-------------------
+Every new session is tagged with the creating user's userId.  All
+subsequent reads, writes, and deletes verify that the authenticated
+user's id matches the document's userId field — a hard equality check
+with no $or fallback.  Old records that lack a userId are inaccessible
+through this API; they are never returned or mutated.
 
-The HTTP server runs alongside the WebSocket server in the same
-process; see `main.py`.
+Public endpoint
+---------------
+GET /  (liveness probe) — unauthenticated, returns service diagnostics.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from typing import Any
 
 from aiohttp import web
 
+import auth
 import db
 import cloudinary_service
 
@@ -40,19 +41,10 @@ logger = logging.getLogger("http_server")
 
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
-#
-# The Vite dev server runs on a different origin (http://localhost:5173)
-# from the API server (http://localhost:8000), so the browser will
-# reject API calls without CORS headers. We add a permissive set of
-# headers — same scope the old Express app used via `cors()` with no
-# config (allow-all).
-
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
     if request.method == "OPTIONS":
-        # Preflight — answer it directly so the actual handler isn't
-        # invoked for non-routes.
         return _with_cors(web.Response(status=204))
     try:
         response = await handler(request)
@@ -68,22 +60,17 @@ def _with_cors(resp: web.StreamResponse) -> web.StreamResponse:
     return resp
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _json_error(status: int, message: str) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
 def _503_if_no_db() -> web.Response | None:
-    """Return a friendly 503 when MongoDB isn't configured."""
     if db.is_enabled():
         return None
     err = db.connection_error()
     if err:
-        # Real connection attempt failed — include the classified
-        # error so the frontend banner can tell the user exactly what
-        # to fix (auth, IP allowlist, malformed URI, etc.).
         message = f"Session persistence is disabled. {err}"
     else:
         message = (
@@ -98,45 +85,32 @@ def _503_if_no_db() -> web.Response | None:
 
 
 def _new_session_id() -> str:
-    """
-    Match the old project's `session_id || Date.now().toString()`
-    pattern — millisecond-since-epoch as a string. We append a short
-    random suffix so two sessions started in the same millisecond
-    (mic + system race on some clients) don't collide on the
-    unique-key index.
-    """
     return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
 
 
-# ── routes ───────────────────────────────────────────────────────────────────
-
+# ── routes ────────────────────────────────────────────────────────────────────
 
 async def post_start_session(request: web.Request) -> web.Response:
     """
-    POST /start-session
+    POST /start-session  [protected]
 
-    Body (optional): {"session_id": "...", "userId": "..."}
-
-    Mirrors the old:
-        const session_id = req.body?.session_id || Date.now().toString();
-        await Session.create({ session_id, userId: req.user.id });
-        res.json({ success: true, session_id });
+    Creates a new session owned by the authenticated user.
+    Body (optional): {"session_id": "..."}
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
     body = await _read_json(request)
     session_id = (
-        (body.get("session_id") if isinstance(body, dict) else None) or _new_session_id()
+        (body.get("session_id") if isinstance(body, dict) else None)
+        or _new_session_id()
     )
-    user_id = body.get("userId") if isinstance(body, dict) else None
 
     try:
         await db.create_session(session_id, user_id=user_id)
     except ValueError as e:
-        # Duplicate session_id — same case the old code didn't guard
-        # against because Mongoose would just throw. We surface it as
-        # 409 so the client can retry with a new id.
         return _json_error(409, str(e))
     except db.MongoNotConfigured as e:
         return _json_error(503, str(e))
@@ -149,48 +123,37 @@ async def post_start_session(request: web.Request) -> web.Response:
 
 async def get_start_session(request: web.Request) -> web.Response:
     """
-    GET /start-session
+    GET /start-session  [protected]
 
-    Convenience equivalent of the old GET handler that just creates a
-    fresh session_id every call.
+    Convenience endpoint — creates a fresh session for the caller.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
     session_id = _new_session_id()
     try:
-        await db.create_session(session_id)
+        await db.create_session(session_id, user_id=user_id)
     except Exception as e:  # noqa: BLE001
         logger.exception("GET start-session failed")
         return _json_error(500, str(e))
+
     return web.json_response({"success": True, "session_id": session_id})
 
 
 async def post_push(request: web.Request) -> web.Response:
     """
-    POST /push
+    POST /push  [protected]
 
     Body: {"session_id": "...", "text": "..."}
 
-    Mirrors the old:
-        const { session_id, text } = req.body;
-        if (!session_id || !text) return 400;
-        const session = await Session.findOne({ session_id });
-        if (!session) return 404;
-        await Session.findOneAndUpdate(
-            { session_id },
-            { text: session.text + text + "\n" }
-        );
-
-    Caller is responsible for formatting the line as
-    `[SOURCE] [HH:MM:SS] message`. We don't restamp it server-side so
-    the old format stays bit-for-bit identical.
-
-    Live Translator only POSTs *finalized* transcripts here — interim
-    turns are filtered on the frontend before /push is called. That's
-    the same invariant the old project had (it only persisted after
-    flushBuffer, never during a live turn).
+    Appends a finalised transcript line to the session.
+    Ownership is verified before the write — users cannot push to
+    sessions they don't own.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
@@ -198,10 +161,19 @@ async def post_push(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return _json_error(400, "missing fields")
 
-    session_id = (body.get("session_id") or "").strip() if isinstance(body.get("session_id"), str) else ""
+    session_id = (
+        body.get("session_id", "").strip()
+        if isinstance(body.get("session_id"), str)
+        else ""
+    )
     text = body.get("text")
     if not session_id or not isinstance(text, str) or not text:
         return _json_error(400, "missing fields")
+
+    # Ownership check — returns None for missing OR wrong owner
+    session = await db.find_session_for_user(session_id, user_id)
+    if session is None:
+        return _json_error(404, "session not found")
 
     try:
         ok = await db.append_text(session_id, text)
@@ -218,51 +190,39 @@ async def post_push(request: web.Request) -> web.Response:
 
 async def get_transcripts(request: web.Request) -> web.Response:
     """
-    GET /transcripts
+    GET /transcripts  [protected]
 
-    Returns a list of session metadata entries:
-        [{ id, label, createdAt }, ...]
-
-    Mirrors the old user-scoped listing. With no auth in the current
-    project we list everyone's sessions; if `?userId=` is supplied as a
-    query param we filter on it for compatibility with old records.
+    Returns only the authenticated user's sessions, newest first.
+    No other user's data is ever included in the response.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
-    user_id = request.query.get("userId") or None
-
     try:
-        items = await db.list_sessions(user_id=user_id)
+        items = await db.list_sessions(user_id)
     except db.MongoNotConfigured as e:
         return _json_error(503, str(e))
     except Exception as e:  # noqa: BLE001
         logger.exception("transcripts list failed")
         return _json_error(500, str(e))
+
     return web.json_response(items)
 
 
 async def get_transcript(request: web.Request) -> web.Response:
     """
-    GET /transcript/{session_id}
+    GET /transcript/{session_id}  [protected]
 
-    Returns the saved transcript AND any AI Meeting Intelligence that
-    has been saved on the same document:
-
-        { "text": "...", "insights": {...} }   # insights omitted if not saved
-
-    All meeting data (transcript + summary + key points + action items
-    + topics + timeline + flashcards + quiz + studyVault) lives on the
-    same session record by design — one query rehydrates the whole
-    meeting. Mirrors the old project's:
-        const session = await Session.findOne({ session_id, ... });
-        if (!session) return 403;
-        res.json({ text: session.text });
-
-    The old code returned 403 when the session didn't belong to the
-    user; with no auth in the current project a missing session is
-    just a 404.
+    Returns the full session (transcript + insights + audio) only if it
+    belongs to the authenticated user.  Returns 403 for sessions that
+    exist but belong to someone else — matching the old MeetMind
+    behaviour — so the caller cannot distinguish "not mine" from "wrong
+    id" and cannot enumerate other users' session ids.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
@@ -271,7 +231,7 @@ async def get_transcript(request: web.Request) -> web.Response:
         return _json_error(400, "session_id required")
 
     try:
-        full = await db.get_session_full(session_id)
+        full = await db.find_session_for_user(session_id, user_id)
     except db.MongoNotConfigured as e:
         return _json_error(503, str(e))
     except Exception as e:  # noqa: BLE001
@@ -284,9 +244,6 @@ async def get_transcript(request: web.Request) -> web.Response:
     response: dict = {"text": full.get("text", "") or ""}
     if "insights" in full and full["insights"] is not None:
         response["insights"] = full["insights"]
-    # Audio fields ride along on the same response so a single
-    # GET /transcript/:id returns the complete saved meeting —
-    # transcript, insights, AND the recording — in one round trip.
     if full.get("audioUrl"):
         response["audioUrl"] = full["audioUrl"]
     if full.get("audioDuration"):
@@ -296,35 +253,16 @@ async def get_transcript(request: web.Request) -> web.Response:
 
 async def post_insights(request: web.Request) -> web.Response:
     """
-    POST /insights
+    POST /insights  [protected]
 
-    Body: {"session_id": "...", "insights": { ...full intelligence object... }}
+    Body: {"session_id": "...", "insights": { ...intelligence object... }}
 
-    Persists AI Meeting Intelligence into the EXISTING session
-    document. Per the project requirement, there is intentionally NO
-    separate vault / meeting_intelligence / quiz / flashcards
-    collection — everything lives on the session record so a single
-    GET /transcript/:session_id returns the whole meeting.
-
-    Expected `insights` shape (from InsightsPanel + studyVault metadata):
-        {
-          summary: str,
-          keyPoints: [str],
-          actionItems: [{task, owner, priority}],
-          topics: [str],
-          timeline: [{time, event}],
-          flashcards: [{front, back}],
-          quiz: [{question, options, answer}],
-          studyVault: {savedAt, lineCount}
-        }
-
-    The endpoint does not validate the inner shape — InsightsPanel
-    owns that contract — so future fields can be added without
-    touching the backend. Each save replaces the previous `insights`
-    subtree atomically.
-
-    Returns 404 if the session_id doesn't exist (same shape as /push).
+    Saves AI Meeting Intelligence into the caller's session.
+    Returns 403/404 if the session doesn't exist or isn't owned by
+    the authenticated user.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
@@ -337,6 +275,11 @@ async def post_insights(request: web.Request) -> web.Response:
     insights = body.get("insights")
     if not session_id or not isinstance(insights, dict):
         return _json_error(400, "session_id and insights object required")
+
+    # Ownership check
+    session = await db.find_session_for_user(session_id, user_id)
+    if session is None:
+        return _json_error(404, "session not found")
 
     try:
         ok = await db.save_insights(session_id, insights)
@@ -353,29 +296,24 @@ async def post_insights(request: web.Request) -> web.Response:
 
 async def delete_transcript(request: web.Request) -> web.Response:
     """
-    DELETE /transcript/{session_id}
+    DELETE /transcript/{session_id}  [protected]
 
-    Removes a saved session — transcript text, AI Meeting
-    Intelligence, audio metadata, all of it — from MongoDB. There is
-    only one document per session by design, so this is one
-    `delete_one` and the meeting is gone in its entirety.
-
-    Returns:
-      200 {"ok": true}                — session removed.
-      404 {"error": "session not found"} — no such session.
-      503 if MongoDB persistence is disabled.
-
-    The backend deliberately does *not* prompt for confirmation —
-    that's the frontend's job (window.confirm in SessionHistory). Once
-    a DELETE arrives here we delete; an HTTP API caller is presumed
-    to have already gathered any consent it needs.
+    Deletes the session (transcript + insights + audio) only if it
+    belongs to the authenticated user.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
     session_id = request.match_info.get("session_id", "").strip()
     if not session_id:
         return _json_error(400, "session_id required")
+
+    # Ownership check — prevents cross-user deletions
+    session = await db.find_session_for_user(session_id, user_id)
+    if session is None:
+        return _json_error(404, "session not found")
 
     try:
         ok = await db.delete_session(session_id)
@@ -390,44 +328,20 @@ async def delete_transcript(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def get_root(_request: web.Request) -> web.Response:
-    """Liveness probe — same shape as the old `app.get("/")`."""
-    return web.json_response(
-        {
-            "status": "ok",
-            "service": "AI Transcriber session API",
-            "persistence": "enabled" if db.is_enabled() else "disabled",
-            "diagnostics": db.diagnostics(),
-            # Frontend reads this so the recording UI can show a
-            # one-line "Cloudinary not configured — recordings disabled"
-            # banner without having to make an extra round-trip.
-            "recording": cloudinary_service.diagnostics(),
-        }
-    )
-
-
 async def post_upload_audio(request: web.Request) -> web.Response:
     """
-    POST /upload-audio (multipart)
+    POST /upload-audio (multipart)  [protected]
 
     Form fields:
-      - session_id : the session this recording belongs to
-      - audio      : the WebM/Opus blob produced by MediaRecorder
+      - session_id : must be owned by the authenticated user
+      - audio      : WebM/Opus blob from MediaRecorder
 
-    Mirrors the old `server.js` `/upload-audio` route. Uploads the
-    blob to Cloudinary, then sets `audioUrl` + `audioDuration` on the
-    EXISTING session document in MongoDB — no separate `recordings`
-    collection. A subsequent GET /transcript/:id returns the audio
-    URL alongside text + insights.
-
-    Returns:
-      200 {"audioUrl": "https://...", "audioDuration": N}
-      400 missing fields
-      404 session not found
-      503 if MongoDB or Cloudinary is not configured (with a clear
-          per-service error message so the frontend can tell the user
-          exactly which env vars to fill in)
+    Uploads to Cloudinary then stores audioUrl + audioDuration on the
+    session document.  The session ownership is verified before the
+    Cloudinary upload so stale / cross-user POSTs don't leak storage.
     """
+    user_id = await auth.require_auth(request)
+
     if (resp := _503_if_no_db()) is not None:
         return resp
 
@@ -443,9 +357,6 @@ async def post_upload_audio(request: web.Request) -> web.Response:
             status=503,
         )
 
-    # Stream-parse the multipart body so we don't have to slurp the
-    # whole audio file into memory before the disk-backed parser does
-    # the same thing.
     try:
         reader = await request.multipart()
     except Exception as e:  # noqa: BLE001
@@ -466,17 +377,15 @@ async def post_upload_audio(request: web.Request) -> web.Response:
                 chunks.append(chunk)
             audio_bytes = b"".join(chunks)
         else:
-            await part.read()  # drain any unexpected fields
+            await part.read()
 
     if not session_id:
         return _json_error(400, "session_id required")
     if not audio_bytes:
         return _json_error(400, "audio file required")
 
-    # Confirm the session exists before paying for the Cloudinary
-    # upload — keeps stale recordings from leaking into Cloudinary if
-    # the client posts a bogus / deleted session_id.
-    existing = await db.find_session(session_id)
+    # Ownership check before paying for the Cloudinary upload
+    existing = await db.find_session_for_user(session_id, user_id)
     if existing is None:
         return _json_error(404, "session not found")
 
@@ -509,19 +418,23 @@ async def post_upload_audio(request: web.Request) -> web.Response:
     )
 
 
-# Original get_root marker — replaced above; keeping this anchor for the
-# build_app() router below.
-def _routes_anchor():
-    return None
+async def get_root(_request: web.Request) -> web.Response:
+    """Liveness probe — unauthenticated."""
+    return web.json_response(
+        {
+            "status": "ok",
+            "service": "AI Transcriber session API",
+            "persistence": "enabled" if db.is_enabled() else "disabled",
+            "diagnostics": db.diagnostics(),
+            "recording": cloudinary_service.diagnostics(),
+        }
+    )
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 async def _read_json(request: web.Request) -> Any:
-    """Read JSON body. Returns {} for empty/invalid bodies."""
     if request.content_length in (0, None):
-        # POST /start-session with no body is legal — match old project.
         return {}
     try:
         return await request.json()
@@ -529,15 +442,9 @@ async def _read_json(request: web.Request) -> Any:
         return {}
 
 
-# ── public entry point ───────────────────────────────────────────────────────
-
+# ── public entry point ────────────────────────────────────────────────────────
 
 def build_app() -> web.Application:
-    """Build the aiohttp Application with all routes registered."""
-    # 100 MB upper bound on request bodies. Audio recordings encoded
-    # at 16 kHz Opus run ~30 MB/hr in the worst case, so 100 MB
-    # comfortably covers a 2-3 hour meeting. Keeps the server from
-    # OOM'ing on a misbehaving / malicious client.
     app = web.Application(
         middlewares=[cors_middleware],
         client_max_size=100 * 1024 * 1024,
@@ -555,11 +462,6 @@ def build_app() -> web.Application:
 
 
 async def start_http_server(host: str = "0.0.0.0", port: int = 8000) -> web.AppRunner:
-    """
-    Start the HTTP REST server. Returns the AppRunner so callers can
-    cleanly shut it down. The server runs forever in the same event
-    loop as the WebSocket server — see main.py.
-    """
     app = build_app()
     runner = web.AppRunner(app)
     await runner.setup()
