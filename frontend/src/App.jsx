@@ -4,6 +4,7 @@ import TranscriptPanel from "./components/TranscriptPanel.jsx";
 import FloatingMicWidget from "./components/FloatingMicWidget.jsx";
 import SessionHistory, { formatSessionLabel } from "./components/SessionHistory.jsx";
 import ConceptDrawer from "./components/ConceptDrawer.jsx";
+import { useAuthToken } from "./hooks/useAuthToken.js";
 import { useTranscriptSocket } from "./hooks/useTranscriptSocket.js";
 import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
@@ -78,6 +79,15 @@ export default function App() {
   // Persistence is best-effort — failures don't interrupt the live
   // pipeline.
   const persistence = useSessionPersistence(HTTP_URL);
+  // Authentication state. The token itself comes from auth.js via the
+  // postMessage SSO bridge; useAuthToken subscribes so the UI flips
+  // from "Sign in to view your saved meetings" to the actual list
+  // the moment MeetMind hands us a JWT (or, on a fresh page load,
+  // when the previously-stored token is rehydrated from
+  // localStorage). `isAuthenticated` is the only piece App needs to
+  // make decisions; the token itself never leaves auth.js / authFetch.
+  const authToken = useAuthToken();
+  const isAuthenticated = Boolean(authToken);
   const [historyOpen, setHistoryOpen] = useState(false);
   // ── viewing a saved session ──────────────────────────────────────────
   // When non-null the main page replaces the live transcript +
@@ -755,13 +765,15 @@ export default function App() {
             type="button"
             onClick={() => setHistoryOpen(true)}
             title={
-              persistence.persistenceEnabled
+              !isAuthenticated
+                ? "Sign in via MeetMind to view your saved meetings"
+                : persistence.persistenceEnabled
                 ? "Browse saved sessions"
                 : "Backend has no MONGO_URI — sessions are not being saved"
             }
             className="px-3 py-1.5 rounded-md text-sm font-medium bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 transition-colors"
           >
-            History
+            {isAuthenticated ? "History" : "🔒 History"}
             {persistence.sessionId ? (
               <span className="ml-1.5 text-xs text-emerald-400">●</span>
             ) : null}
@@ -1017,6 +1029,7 @@ export default function App() {
         onDeleteSession={handleDeleteSession}
         currentSessionId={persistence.sessionId}
         viewedSessionId={viewedSession?.id || null}
+        isAuthenticated={isAuthenticated}
       />
 
       {/* Concept drawer — opens whenever the user clicks a

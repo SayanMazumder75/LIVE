@@ -77,6 +77,13 @@ export default function SessionHistory({
   onDeleteSession,
   currentSessionId,
   viewedSessionId,
+  // True when a JWT has been received via the auth.js postMessage
+  // bridge (or restored from localStorage on a previous visit). The
+  // drawer skips the /transcripts fetch and renders a sign-in
+  // placeholder when this is false, so the saved-sessions list is
+  // gated on authentication exactly the way speech-to-text gates
+  // its history.
+  isAuthenticated,
 }) {
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -100,17 +107,27 @@ export default function SessionHistory({
     }
   }, [listSessions]);
 
-  // Auto-refresh in two cases:
+  // Auto-refresh in three cases:
   //   1. drawer opens — get the freshest list before the user reads it
   //   2. a new live session_id appears (Start Translation just ran) —
   //      so the count badge in the header bumps up immediately
   //      without the user having to hit the Refresh button.
+  //   3. authentication state flips to true — a token just arrived
+  //      via postMessage, the drawer should now load the previously-
+  //      hidden list.
   // Deletes are already handled inline by `handleDelete`, which both
   // optimistically removes the row and re-runs `refresh` to reconcile
   // with the server.
   useEffect(() => {
-    if (open) refresh();
-  }, [open, currentSessionId, refresh]);
+    if (!open) return;
+    if (!isAuthenticated) {
+      // Drop any stale list from a prior session so a logged-out
+      // user never glimpses cached entries from someone else.
+      setSessions([]);
+      return;
+    }
+    refresh();
+  }, [open, currentSessionId, isAuthenticated, refresh]);
 
   const handleOpen = useCallback(
     (session) => {
@@ -233,9 +250,17 @@ export default function SessionHistory({
                   minWidth: 22,
                   textAlign: "center",
                 }}
-                aria-label={`${sessions.length} saved sessions`}
+                aria-label={
+                  isAuthenticated
+                    ? `${sessions.length} saved sessions`
+                    : "Sign in required to view saved sessions"
+                }
               >
-                {loading && sessions.length === 0 ? "…" : sessions.length}
+                {!isAuthenticated
+                  ? "🔒"
+                  : loading && sessions.length === 0
+                  ? "…"
+                  : sessions.length}
               </span>
             </h2>
             <p
@@ -245,14 +270,21 @@ export default function SessionHistory({
                 color: "#94a3b8",
               }}
             >
-              Click a row to open the meeting in the main page.
+              {isAuthenticated
+                ? "Click a row to open the meeting in the main page."
+                : "Sign in to view your saved meetings."}
             </p>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             <button
               type="button"
               onClick={refresh}
-              disabled={loading}
+              disabled={loading || !isAuthenticated}
+              title={
+                !isAuthenticated
+                  ? "Sign in via MeetMind to load your saved sessions"
+                  : "Reload the list from the server"
+              }
               style={{
                 background: "#1e293b",
                 border: "1px solid #334155",
@@ -260,7 +292,8 @@ export default function SessionHistory({
                 padding: "6px 12px",
                 fontSize: 12,
                 borderRadius: 6,
-                cursor: loading ? "not-allowed" : "pointer",
+                cursor: loading || !isAuthenticated ? "not-allowed" : "pointer",
+                opacity: !isAuthenticated ? 0.5 : 1,
               }}
             >
               {loading ? "Refreshing…" : "Refresh"}
@@ -291,37 +324,46 @@ export default function SessionHistory({
             padding: "8px 0",
           }}
         >
-          {refreshError ? (
-            <div
-              style={{
-                margin: "8px 12px",
-                padding: "8px 10px",
-                borderRadius: 6,
-                background: "rgba(239,68,68,0.1)",
-                border: "1px solid rgba(239,68,68,0.3)",
-                color: "#fca5a5",
-                fontSize: 12,
-              }}
-            >
-              {refreshError}
-            </div>
-          ) : null}
+          {!isAuthenticated ? (
+            // ── Sign-in placeholder ──────────────────────────────
+            // Replaces the entire saved-sessions list when no JWT
+            // has been received yet. Same treatment speech-to-text
+            // gives its history view, transposed to the LIVE
+            // drawer's visual language.
+            <SignInPlaceholder />
+          ) : (
+            <>
+              {refreshError ? (
+                <div
+                  style={{
+                    margin: "8px 12px",
+                    padding: "8px 10px",
+                    borderRadius: 6,
+                    background: "rgba(239,68,68,0.1)",
+                    border: "1px solid rgba(239,68,68,0.3)",
+                    color: "#fca5a5",
+                    fontSize: 12,
+                  }}
+                >
+                  {refreshError}
+                </div>
+              ) : null}
 
-          {!loading && sessions.length === 0 && !refreshError ? (
-            <p
-              style={{
-                margin: "12px 14px",
-                fontSize: 12,
-                color: "#64748b",
-                lineHeight: 1.5,
-              }}
-            >
-              No sessions yet. Start a translation to create one. If
-              you don't see anything after recording, check that{" "}
-              <code style={{ color: "#94a3b8" }}>MONGO_URI</code> is
-              set in <code style={{ color: "#94a3b8" }}>backend/.env</code>.
-            </p>
-          ) : null}
+              {!loading && sessions.length === 0 && !refreshError ? (
+                <p
+                  style={{
+                    margin: "12px 14px",
+                    fontSize: 12,
+                    color: "#64748b",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  No sessions yet. Start a translation to create one. If
+                  you don't see anything after recording, check that{" "}
+                  <code style={{ color: "#94a3b8" }}>MONGO_URI</code> is
+                  set in <code style={{ color: "#94a3b8" }}>backend/.env</code>.
+                </p>
+              ) : null}
 
           {deleteError ? (
             <div
@@ -470,8 +512,101 @@ export default function SessionHistory({
 
           {/* Spinner keyframes for the trash button's loading state. */}
           <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            </>
+          )}
         </div>
       </aside>
     </>
+  );
+}
+
+/**
+ * SignInPlaceholder
+ * -----------------
+ * Renders inside the saved-sessions drawer when no JWT is held.
+ * Mirrors the speech-to-text behaviour: the rest of the app keeps
+ * working, but this view is locked behind authentication.
+ *
+ * The user gets:
+ *   - a clear lock + heading explaining what's gated and why,
+ *   - a one-line note about how to obtain a token (postMessage SSO
+ *     from MeetMind), so the empty state is informative rather
+ *     than just "you can't see this".
+ *
+ * Implementation note: this component is intentionally pure and
+ * stateless — it knows nothing about how to actually log the user
+ * in. That's by design. The auth flow itself is owned by auth.js
+ * and the parent MeetMind window; the drawer just reflects the
+ * current state of the singleton store via the isAuthenticated
+ * prop.
+ */
+function SignInPlaceholder() {
+  return (
+    <div
+      style={{
+        margin: "16px 14px",
+        padding: "20px 18px",
+        borderRadius: 10,
+        background:
+          "linear-gradient(135deg, rgba(56,189,248,0.08), rgba(15,23,42,0.6))",
+        border: "1px solid rgba(56,189,248,0.25)",
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+        color: "#cbd5e1",
+      }}
+    >
+      <div
+        style={{
+          width: 40,
+          height: 40,
+          borderRadius: 10,
+          background: "rgba(56,189,248,0.15)",
+          border: "1px solid rgba(56,189,248,0.4)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: 18,
+        }}
+        aria-hidden="true"
+      >
+        🔒
+      </div>
+      <h3
+        style={{
+          margin: 0,
+          fontSize: 13,
+          fontWeight: 700,
+          color: "#e2e8f0",
+        }}
+      >
+        Sign in to view your saved meetings
+      </h3>
+      <p
+        style={{
+          margin: 0,
+          fontSize: 12,
+          lineHeight: 1.55,
+          color: "#94a3b8",
+        }}
+      >
+        Your saved transcripts, AI insights, and meeting recordings
+        are private. Open the LIVE Translator from inside MeetMind —
+        it sends a signed token via secure postMessage and your
+        history will appear here automatically.
+      </p>
+      <p
+        style={{
+          margin: "4px 0 0",
+          fontSize: 11,
+          lineHeight: 1.5,
+          color: "#64748b",
+        }}
+      >
+        Live transcription, AI Insights, and recording all keep
+        working without signing in — only the saved-history list is
+        gated.
+      </p>
+    </div>
   );
 }

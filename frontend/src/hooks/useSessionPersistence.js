@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { authFetch } from "../auth.js";
 
 /**
  * useSessionPersistence
@@ -70,7 +71,12 @@ export function useSessionPersistence(httpUrl) {
   const _post = useCallback(
     async (path, body) => {
       const url = `${baseUrl}${path}`;
-      const res = await fetch(url, {
+      // authFetch attaches the Bearer token automatically when one
+      // is held; falls through to a normal fetch otherwise. So this
+      // path keeps working for users without auth (the backend
+      // doesn't currently enforce JWT) while gracefully gaining
+      // SSO when a token arrives via postMessage.
+      const res = await authFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body || {}),
@@ -103,7 +109,7 @@ export function useSessionPersistence(httpUrl) {
   const _get = useCallback(
     async (path) => {
       const url = `${baseUrl}${path}`;
-      const res = await fetch(url);
+      const res = await authFetch(url);
       if (res.status === 503) {
         let reason = "";
         try {
@@ -134,6 +140,10 @@ export function useSessionPersistence(httpUrl) {
     let cancelled = false;
     (async () => {
       try {
+        // Probe is unauthenticated by design — the GET / endpoint
+        // returns server diagnostics that should be visible to all
+        // visitors so they can see whether the backend is up at
+        // all, even before signing in.
         const res = await fetch(`${baseUrl}/`);
         if (!res.ok) return;
         const data = await res.json();
@@ -429,7 +439,7 @@ export function useSessionPersistence(httpUrl) {
       form.append("audio", file, filename);
 
       try {
-        const res = await fetch(`${baseUrl}/upload-audio`, {
+        const res = await authFetch(`${baseUrl}/upload-audio`, {
           method: "POST",
           body: form,
         });
@@ -496,7 +506,7 @@ export function useSessionPersistence(httpUrl) {
       }
       try {
         const url = `${baseUrl}/transcript/${encodeURIComponent(sid)}`;
-        const res = await fetch(url, { method: "DELETE" });
+        const res = await authFetch(url, { method: "DELETE" });
         if (res.status === 503) {
           let reason = "";
           try {
