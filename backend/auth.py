@@ -85,7 +85,8 @@ async def require_auth(request: web.Request) -> str:
         raise _unauthorized(
             "Server misconfiguration: JWT_SECRET is not set in backend/.env."
         )
-
+    logger.info("JWT_SECRET loaded, length=%d", len(secret))
+    
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise _unauthorized("No token provided.")

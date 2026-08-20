@@ -1,34 +1,23 @@
-/**
- * auth.js — AI Transcriber (embedded in MeetMind)
- *
- * Receives JWT from MeetMind via postMessage (SSO bridge).
- * Stores token in memory + localStorage for page refresh survival.
- * Exports getToken() used by Axios interceptor in main.jsx / App.jsx
- *
- * SETUP: import this file early in main.jsx BEFORE App renders:
- *   import "./auth";
- */
-
-// ⚠️ SET THIS to your exact MeetMind frontend domain (no trailing slash)
-// Examples:
-//   "https://meetmind.vercel.app"
-//   "http://localhost:3000"
 const MEETMIND_ORIGIN = import.meta.env.VITE_MEETMIND_ORIGIN || "http://localhost:5173";
-
-const LS_KEY = "transcriber_auth_token"; // different key from stt_auth_token — avoids collision
+const LS_KEY = "transcriber_auth_token";
 
 let authToken = null;
+const listeners = new Set(); // ← NEW
 
-// On load: restore from localStorage (handles page refresh inside iframe)
 try {
   const stored = localStorage.getItem(LS_KEY);
   if (stored) authToken = stored;
 } catch {}
 
-// Listen for JWT sent from MeetMind parent window
+function _notify() {
+  for (const fn of listeners) {
+    try { fn(authToken); } catch {}
+  }
+}
+
 window.addEventListener("message", (event) => {
-  // Strict origin check — reject anything not from MeetMind
   if (event.origin !== MEETMIND_ORIGIN) return;
+  if (event.source !== window.parent) return; // hardening from your spec
 
   if (
     event.data &&
@@ -37,38 +26,27 @@ window.addEventListener("message", (event) => {
     event.data.token.length > 0
   ) {
     authToken = event.data.token;
-    try {
-      localStorage.setItem(LS_KEY, event.data.token);
-    } catch {}
+    try { localStorage.setItem(LS_KEY, event.data.token); } catch {}
     console.log("[Transcriber] Auth token received from MeetMind.");
+    _notify(); // ← NEW, this is what makes App.jsx re-render
   }
 });
 
-/**
- * Returns current JWT token.
- * Used by Axios interceptor to attach Authorization header.
- */
 export const getToken = () => {
   if (authToken) return authToken;
-  try {
-    return localStorage.getItem(LS_KEY);
-  } catch {
-    return null;
-  }
+  try { return localStorage.getItem(LS_KEY); } catch { return null; }
 };
 
-/**
- * Clear token (logout / token expired handling)
- */
 export const clearToken = () => {
   authToken = null;
-  try {
-    localStorage.removeItem(LS_KEY);
-  } catch {}
+  try { localStorage.removeItem(LS_KEY); } catch {}
+  _notify();
 };
 
-/**
- * True only when a token is present.
- * Used by App.jsx for the auth gate.
- */
 export const isAuthenticated = () => Boolean(getToken());
+
+/** Subscribe to token changes. Returns unsubscribe fn. */
+export const subscribeAuth = (fn) => {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+};

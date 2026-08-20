@@ -20,6 +20,22 @@ On those hosts you create two services pointing at the same repo,
 set RUN_MODE accordingly, and the host's `PORT` env var picks up
 automatically.
 
+Port precedence
+----------------
+When a service is running in a SINGLE-purpose mode (RUN_MODE=http or
+RUN_MODE=ws), the platform-injected `PORT` env var is treated as
+authoritative and checked BEFORE the manual `HTTP_PORT` / `WS_PORT`
+override. This matters on Render: only the port Render assigns via
+`PORT` is actually routed to the public internet. A stray `HTTP_PORT`
+or `WS_PORT` left over from local-dev .env (or copy-pasted between
+services) would otherwise silently win and the service would start
+fine internally while being completely unreachable from outside —
+exactly the "WebSocket connection failed" symptom this fixes.
+
+In RUN_MODE=all (local dev, no split), the old precedence is kept
+(HTTP_PORT / WS_PORT first, PORT as a fallback for HTTP) since PORT is
+rarely set locally and both servers share the same process anyway.
+
 Both servers share a single MongoDB connection (see `db.py`). If
 `MONGO_URI` is unset the persistence routes return 503 but the
 WebSocket transcription path keeps working — the audio pipeline has
@@ -73,13 +89,20 @@ def _ws_host() -> str:
 def _ws_port(mode: str) -> int:
     """
     Pick the port for the WS server.
-    - RUN_MODE=ws  → prefer WS_PORT, then PORT, then default 8001.
-    - RUN_MODE=all → prefer WS_PORT, then default 8001 (PORT is HTTP's).
+
+    - RUN_MODE=ws  → PORT (platform-assigned, authoritative) first,
+                      then WS_PORT as a manual override, then 8001.
+    - RUN_MODE=all → WS_PORT first (PORT belongs to HTTP in this mode),
+                      then default 8001.
     """
-    candidates = [os.getenv("WS_PORT")]
+    candidates: list[str | None] = []
     if mode == "ws":
         candidates.append(os.getenv("PORT"))
+        candidates.append(os.getenv("WS_PORT"))
+    else:
+        candidates.append(os.getenv("WS_PORT"))
     candidates.append("8001")
+
     for raw in candidates:
         if raw is None:
             continue
@@ -97,16 +120,22 @@ def _http_host() -> str:
 def _http_port(mode: str) -> int:
     """
     Pick the port for the HTTP server.
-    - RUN_MODE=http → prefer HTTP_PORT, then PORT, then default 8000.
-    - RUN_MODE=all  → prefer HTTP_PORT, then PORT, then default 8000.
-                       (PORT is the more common single-port host
-                        convention; if the user only wants one server
-                        they typically set HTTP_PORT explicitly.)
+
+    - RUN_MODE=http → PORT (platform-assigned, authoritative) first,
+                       then HTTP_PORT as a manual override, then 8000.
+    - RUN_MODE=all  → HTTP_PORT first, then PORT as a fallback (common
+                       single-port-host convention), then default 8000.
     """
-    candidates = [os.getenv("HTTP_PORT")]
-    if mode == "http" or mode == "all":
+    candidates: list[str | None] = []
+    if mode == "http":
         candidates.append(os.getenv("PORT"))
+        candidates.append(os.getenv("HTTP_PORT"))
+    else:
+        candidates.append(os.getenv("HTTP_PORT"))
+        if mode == "all":
+            candidates.append(os.getenv("PORT"))
     candidates.append("8000")
+
     for raw in candidates:
         if raw is None:
             continue

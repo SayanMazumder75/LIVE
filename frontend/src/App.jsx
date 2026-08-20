@@ -8,7 +8,7 @@ import { useMixedAudio } from "./hooks/useMixedAudio.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { parseSavedTranscript } from "./hooks/parseSavedTranscript.js";
 import InsightsPanel from "./components/InsightsPanel.jsx";
-import { isAuthenticated } from "./auth.js";
+import { getToken, subscribeAuth } from "./auth.js";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8001";
 const HTTP_URL = import.meta.env.VITE_HTTP_URL || "http://localhost:8000";
@@ -20,6 +20,10 @@ const HINDI_SILENCE_RMS = (() => {
   const n = parseFloat(raw);
   return Number.isFinite(n) && n >= 0 ? n : 0.01;
 })();
+
+// How long to wait for MeetMind's postMessage before giving up and
+// showing "Authentication Required" instead of spinning forever.
+const AUTH_WAIT_TIMEOUT_MS = 8000;
 
 const LANGS = {
   en: { label: "English" },
@@ -108,14 +112,48 @@ function AuthRequired() {
   );
 }
 
+// ── Auth gate — shown while waiting for MeetMind's postMessage ───────────────
+function AuthWaiting() {
+  return (
+    <div
+      className="min-h-screen w-full flex flex-col items-center justify-center"
+      style={{ backgroundColor: "#0f172a", color: "#94a3b8" }}
+    >
+      <p style={{ fontSize: "0.95rem" }}>Connecting to MeetMind…</p>
+    </div>
+  );
+}
+
 export default function App() {
-  // ── Auth gate — FIRST thing inside App(), before any other hooks ─────────
-  // isAuthenticated() reads from memory / localStorage — safe to call here.
-  // React rules are satisfied: no hooks are called conditionally below this;
-  // all useState/useRef/etc. declarations come AFTER this early-return guard.
-  if (!isAuthenticated()) {
-    return <AuthRequired />;
-  }
+  // ── Auth state machine ────────────────────────────────────────────────
+  // "waiting"        — mounted, no token yet, still listening for postMessage
+  // "authenticated"  — token present, render the app
+  // "unauthenticated"— explicitly cleared, or wait timed out with no token
+  //
+  // This subscribes to auth.js's pub/sub so a token that arrives AFTER
+  // this component mounts (the normal case — postMessage is async) still
+  // flips this state and re-renders. No hooks below are conditional on
+  // this value; the gate is applied only to the JSX returned at the end.
+  const [authState, setAuthState] = useState(() =>
+    getToken() ? "authenticated" : "waiting"
+  );
+
+  useEffect(() => {
+    const unsubscribe = subscribeAuth((token) => {
+      setAuthState(token ? "authenticated" : "unauthenticated");
+    });
+
+    const timeoutId = setTimeout(() => {
+      setAuthState((current) =>
+        current === "waiting" ? "unauthenticated" : current
+      );
+    }, AUTH_WAIT_TIMEOUT_MS);
+
+    return () => {
+      unsubscribe();
+      clearTimeout(timeoutId);
+    };
+  }, []);
 
   const [language, setLanguage] = useState("en");
 
@@ -622,6 +660,10 @@ export default function App() {
     if (micActive) return "Listening (mic + system)…";
     return "System audio only";
   })();
+
+  // ── Auth gate applied here, after every hook above has run ─────────────
+  if (authState === "waiting") return <AuthWaiting />;
+  if (authState === "unauthenticated") return <AuthRequired />;
 
   return (
     <div
