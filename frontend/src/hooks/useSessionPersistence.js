@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getToken } from "../auth.js";
+import { getToken, waitForToken } from "../auth.js";
 /**
  * useSessionPersistence
  * ---------------------
@@ -70,7 +70,7 @@ export function useSessionPersistence(httpUrl) {
   const _post = useCallback(
     async (path, body) => {
       const url = `${baseUrl}${path}`;
-      const token = getToken();
+      const token = (await waitForToken()) || getToken();
 
 const res = await fetch(url, {
   method: "POST",
@@ -110,7 +110,7 @@ const res = await fetch(url, {
   const _get = useCallback(
     async (path) => {
       const url = `${baseUrl}${path}`;
-      const token = getToken();
+      const token = (await waitForToken()) || getToken();
 
 const res = await fetch(url, {
   headers: token

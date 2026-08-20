@@ -50,3 +50,30 @@ export const subscribeAuth = (fn) => {
   listeners.add(fn);
   return () => listeners.delete(fn);
 };
+
+/**
+ * Resolves with the auth token as soon as one is available.
+ * If a token is already cached it resolves synchronously (next microtask).
+ * Otherwise it waits up to `timeoutMs` (default 5 s) for the postMessage
+ * from MeetMind before resolving with null — so callers never hang forever.
+ */
+export const waitForToken = (timeoutMs = 5000) => {
+  const current = getToken();
+  if (current) return Promise.resolve(current);
+
+  return new Promise((resolve) => {
+    let unsub;
+    const timer = setTimeout(() => {
+      unsub?.();
+      resolve(null);
+    }, timeoutMs);
+
+    unsub = subscribeAuth((token) => {
+      if (token) {
+        clearTimeout(timer);
+        unsub();
+        resolve(token);
+      }
+    });
+  });
+};
