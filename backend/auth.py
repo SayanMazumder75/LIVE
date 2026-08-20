@@ -96,11 +96,33 @@ async def require_auth(request: web.Request) -> str:
         raise _unauthorized("No token provided.")
 
     try:
-        decoded = jwt.decode(token, secret, algorithms=["HS256"])
+        decoded = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+        )
+
     except jwt.ExpiredSignatureError:
+        logger.warning("JWT validation failed: token expired")
         raise _unauthorized("Token has expired.")
+
+    except jwt.InvalidSignatureError:
+        logger.warning("JWT validation failed: invalid signature")
+        raise _unauthorized("Invalid token.")
+
+    except jwt.InvalidAlgorithmError:
+        logger.warning("JWT validation failed: invalid algorithm")
+        raise _unauthorized("Invalid token.")
+
+    except jwt.DecodeError:
+        logger.warning("JWT validation failed: malformed token")
+        raise _unauthorized("Invalid token.")
+
     except jwt.InvalidTokenError as e:
-        logger.debug("JWT validation failed: %s", e)
+        logger.warning(
+            "JWT validation failed: %s",
+            type(e).__name__,
+        )
         raise _unauthorized("Invalid token.")
 
     user_id = decoded.get("id") or decoded.get("_id") or decoded.get("sub")
