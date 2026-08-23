@@ -33,7 +33,11 @@ async function callClaude(prompt) {
       ],
 
       temperature: 0.3,
-      max_tokens: 2000,
+      // qwen/qwen3.6-27b supports up to 16 384 output tokens.
+      // The full insights payload (5 key points, 4 quiz questions,
+      // 5 flashcards, 10 concepts, timeline …) needs ~3 000–4 000 tokens.
+      // 2 000 caused json_validate_failed by truncating mid-object.
+      max_tokens: 6000,
 
       // Return valid JSON
       response_format: {
