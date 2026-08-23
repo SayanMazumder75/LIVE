@@ -89,7 +89,7 @@ cp .env.example .env
 ```ini
 ASSEMBLYAI_API_KEY=your_assemblyai_key
 GROQ_API_KEY=                        # optional: enables Hindi -> English translation
-GROQ_MODEL=                          # optional: defaults to llama-3.3-70b-versatile
+GROQ_MODEL=                          # optional: defaults to qwen/qwen3.6-27b
 WS_HOST=0.0.0.0                      # optional
 WS_PORT=8001                         # optional
 ```
@@ -105,7 +105,7 @@ You should see:
 
 ```
 [INFO] websocket_server: transcriber WS server listening on ws://0.0.0.0:8001
-[INFO] translator: translator enabled (provider=groq, model=llama-3.3-70b-versatile)
+[INFO] translator: translator enabled (provider=groq, model=qwen/qwen3.6-27b)
 ```
 
 ### Wire protocol

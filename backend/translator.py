@@ -29,7 +29,7 @@ Environment variables
 ---------------------
     GROQ_API_KEY     required to enable translations
                      get a free key: https://console.groq.com/keys
-    GROQ_MODEL       optional, defaults to "llama-3.3-70b-versatile"
+    GROQ_MODEL       optional, defaults to "qwen/qwen3.6-27b"
                      (multilingual, supports Hindi well, free tier)
 
 Wire format (OpenAI Chat Completions, hosted by Groq)
@@ -54,7 +54,7 @@ from typing import Optional
 
 logger = logging.getLogger("translator")
 
-GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+GROQ_DEFAULT_MODEL = "qwen/qwen3.6-27b"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Hindi-only translator. The defensive "English stays English" rule
@@ -106,7 +106,7 @@ def _http_status_message(status: int) -> str:
     if status == 404:
         return (
             "Groq model not found. Check GROQ_MODEL — defaults to "
-            "llama-3.3-70b-versatile."
+            "qwen/qwen3.6-27b."
         )
     if status >= 500:
         return f"Groq is temporarily unavailable (HTTP {status}). Try again."

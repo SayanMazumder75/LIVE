@@ -125,7 +125,7 @@ export default function ConceptDrawer({
         console.error(e);
         setError(
           e.message ||
-            "Could not generate the explanation. Check VITE_GROQ_API_KEY in frontend/.env."
+          "Could not generate the explanation. Check VITE_GROQ_API_KEY in frontend/.env."
         );
         if (!force) setExplanation(null);
       } finally {
@@ -348,20 +348,20 @@ export default function ConceptDrawer({
                 saveStatus === "saved"
                   ? "#4ade80"
                   : saveStatus === "error"
-                  ? "#fca5a5"
-                  : "#94a3b8",
+                    ? "#fca5a5"
+                    : "#94a3b8",
               minHeight: 16,
             }}
           >
             {saveStatus === "saving"
               ? "Saving…"
               : saveStatus === "saved"
-              ? `✓ ${saveMessage}`
-              : saveStatus === "error"
-              ? `✗ ${saveMessage}`
-              : explanation
-              ? "Explanation cached for this session."
-              : ""}
+                ? `✓ ${saveMessage}`
+                : saveStatus === "error"
+                  ? `✗ ${saveMessage}`
+                  : explanation
+                    ? "Explanation cached for this session."
+                    : ""}
           </div>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -599,8 +599,8 @@ function SolvedExampleBlock({ data }) {
                 typeof step.explanation === "string"
                   ? step.explanation.trim()
                   : typeof step.text === "string"
-                  ? step.text.trim()
-                  : "";
+                    ? step.text.trim()
+                    : "";
               const stepDiagram = step.diagram || null;
               const isLast = i === steps.length - 1;
               return (
@@ -945,7 +945,7 @@ function SkeletonExplanation() {
 // ─────────────────────────────────────────────────────────────────────────
 
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODEL = "qwen/qwen3.6-27b";
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || "";
 
 async function callGroqForExplanation(concept, contextText) {
