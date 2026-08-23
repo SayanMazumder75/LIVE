@@ -946,11 +946,21 @@ function SkeletonExplanation() {
 
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "qwen/qwen3.6-27b";
-const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || "";
+// Prefer a dedicated concept key (separate Groq account / quota bucket).
+// Falls back to the shared key so nothing breaks if only one key is set.
+//   Primary  → VITE_GROQ_API_KEY_CONCEPT  (add to frontend/.env)
+//   Fallback → VITE_GROQ_API_KEY
+const GROQ_API_KEY_CONCEPT =
+  import.meta.env.VITE_GROQ_API_KEY_CONCEPT ||
+  import.meta.env.VITE_GROQ_API_KEY ||
+  "";
 
 async function callGroqForExplanation(concept, contextText) {
-  if (!GROQ_API_KEY) {
-    throw new Error("VITE_GROQ_API_KEY is not set in frontend/.env");
+  if (!GROQ_API_KEY_CONCEPT) {
+    throw new Error(
+      "No Groq API key found. Set VITE_GROQ_API_KEY_CONCEPT (recommended) " +
+      "or VITE_GROQ_API_KEY in frontend/.env"
+    );
   }
   const trimmedContext = (contextText || "").slice(0, 2000);
   const prompt = `You are a teacher creating a one-shot study guide for the term below.
@@ -1186,7 +1196,7 @@ ${trimmedContext || "(no additional context provided)"}
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_API_KEY}`,
+      Authorization: `Bearer ${GROQ_API_KEY_CONCEPT}`,
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
@@ -1205,7 +1215,10 @@ ${trimmedContext || "(no additional context provided)"}
         { role: "user", content: prompt },
       ],
       temperature: 0.4,
-      max_tokens: 1600,
+      // qwen/qwen3.6-27b supports up to 16 384 tokens.
+      // The concept payload (diagrams + solved example steps) needs ~2 500–3 500.
+      // 1600 was causing silent truncation on complex topics.
+      max_tokens: 4000,
     }),
   });
   if (!res.ok) {
