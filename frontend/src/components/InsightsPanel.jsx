@@ -10,24 +10,98 @@ const GROQ_MODEL = "llama-3.3-70b-versatile";
 // Add VITE_GROQ_API_KEY=your_key to frontend .env
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || "";
 
+// ── helpers ──────────────────────────────────────────────────────────────
+
+// Extract the first JSON object/array from a string, stripping any markdown
+// fences or preamble the model might have added despite the system prompt.
+function extractJSON(raw) {
+  // Strip ```json ... ``` or ``` ... ``` fences
+  let s = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  // Find the outermost { ... } block
+  const start = s.indexOf("{");
+  const end   = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start)
+    throw new Error("No JSON object found in model response.");
+  return JSON.parse(s.slice(start, end + 1));
+}
+
 // ── direct Groq call (no backend needed) ─────────────────────────────────
-async function callClaude(prompt) {
+//
+// Key design decisions:
+//   • max_tokens 4096 — the full insights payload (5 key points, 4 quiz
+//     questions, 5 flashcards, 10 concepts …) easily exceeds 2 000 tokens.
+//     Truncated output is the #1 cause of Groq's json_validate_failed 400.
+//   • System message — instructs the model at the system level to return
+//     raw JSON only; reduces the chance of markdown wrappers leaking through.
+//   • One automatic retry — transient 429 / 5xx / empty-generation errors
+//     often resolve on a second attempt without any user action.
+//   • Throws a detailed Error — the catch block in generate() now surfaces
+//     the real Groq error code instead of a generic string.
+async function callGroq(prompt, { attempt = 1 } = {}) {
   if (!GROQ_API_KEY) throw new Error("VITE_GROQ_API_KEY not set in frontend .env");
+
   const res = await fetch(GROQ_ENDPOINT, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      messages: [{ role: "user", content: prompt }],
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a JSON-only API. Output a single valid JSON object with no " +
+            "markdown fences, no prose, no comments. Never truncate — emit the " +
+            "complete object including all closing braces.",
+        },
+        { role: "user", content: prompt },
+      ],
       temperature: 0.3,
-      max_tokens: 2000,
+      // 4096 gives enough headroom for the full insights payload.
+      // 2000 (the old value) was the primary cause of json_validate_failed:
+      // the model ran out of budget mid-object and Groq rejected the result.
+      max_tokens: 4096,
     }),
   });
-  if (!res.ok) throw new Error(`Groq ${res.status}`);
+
+  if (!res.ok) {
+    // Parse the Groq error envelope so we can show the real reason.
+    let errBody = {};
+    try { errBody = await res.json(); } catch (_) { /* non-JSON error page */ }
+    const code    = errBody?.error?.code    || errBody?.code    || "";
+    const message = errBody?.error?.message || errBody?.message || res.statusText;
+
+    // Retry once on transient server / rate-limit errors.
+    if (attempt < 2 && (res.status === 429 || res.status >= 500)) {
+      await new Promise((r) => setTimeout(r, 1500));
+      return callGroq(prompt, { attempt: attempt + 1 });
+    }
+
+    throw new Error(
+      res.status === 400 && code === "json_validate_failed"
+        ? `Groq couldn't finish the JSON (json_validate_failed). ` +
+          `Try shortening the transcript or clicking Generate again.`
+        : res.status === 429
+          ? `Groq rate limit hit. Wait a moment and try again.`
+          : `Groq ${res.status}${code ? ` (${code})` : ""}: ${message}`
+    );
+  }
+
   const data = await res.json();
-  const text = data.choices?.[0]?.message?.content || "";
-  const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+  const text  = data.choices?.[0]?.message?.content || "";
+
+  if (!text.trim()) {
+    // Empty generation — retry once before giving up.
+    if (attempt < 2) {
+      await new Promise((r) => setTimeout(r, 800));
+      return callGroq(prompt, { attempt: attempt + 1 });
+    }
+    throw new Error("Groq returned an empty response. Try again.");
+  }
+
+  return extractJSON(text);
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -568,11 +642,13 @@ For "concepts":
 Quiz: options array has exactly 4 items, answer must match one option exactly.`;
 
     try {
-      const data = await callClaude(prompt);
+      const data = await callGroq(prompt);
       setInsights(data);
     } catch (e) {
-      setError("AI generation failed. Check backend or transcript length.");
-      console.error(e);
+      // Surface the real Groq error message so the user can act on it
+      // (e.g. rate limit → wait, json_validate_failed → try again).
+      setError(e.message || "AI generation failed. Check your GROQ API key.");
+      console.error("[InsightsPanel] generate error:", e);
     } finally {
       setLoading(false);
     }
