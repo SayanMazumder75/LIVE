@@ -1212,6 +1212,12 @@ function extractJsonObject(input) {
 
   let s = String(input).trim();
 
+  // Strip Qwen/DeepSeek-style <think>…</think> chain-of-thought blocks.
+  // Thinking models emit these before the actual output; the blocks often
+  // contain { characters that would fool the brace-matcher below into
+  // treating reasoning prose as the JSON candidate.
+  s = s.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
   // Strip leading + trailing markdown code fences (```json, ``` js, ```
   // — language tag optional, surrounding whitespace tolerated).
   s = s.replace(/^```[a-zA-Z0-9_-]*\s*\n?/i, "");
