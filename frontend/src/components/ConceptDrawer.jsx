@@ -1188,7 +1188,7 @@ async function attemptGroqRequest(requestBody, model, concept) {
     return null;
   }
 
-  return parsed;
+  return normalizeExplanation(parsed);
 }
 
 /**
@@ -1209,6 +1209,160 @@ function isValidConceptExplanation(result) {
   return true;
 }
 
+/**
+ * normalizeExplanation
+ * --------------------
+ * Runs normalizeDiagram() over every diagram field in the explanation
+ * object so the renderer always receives a canonical shape regardless
+ * of which variant the model happened to return.
+ */
+function normalizeExplanation(result) {
+  if (!result || typeof result !== "object") return result;
+  const out = { ...result };
+  if (out.diagram)        out.diagram        = normalizeDiagram(out.diagram);
+  if (out.exampleDiagram) out.exampleDiagram = normalizeDiagram(out.exampleDiagram);
+  if (out.solvedExample?.steps) {
+    out.solvedExample = {
+      ...out.solvedExample,
+      steps: out.solvedExample.steps.map((step) =>
+        step?.diagram
+          ? { ...step, diagram: normalizeDiagram(step.diagram) }
+          : step
+      ),
+    };
+  }
+  return out;
+}
+
+/**
+ * normalizeDiagram
+ * ----------------
+ * The ConceptDiagrams renderer expects specific canonical shapes, but
+ * models sometimes return structurally equivalent but differently-keyed
+ * objects. This converts any known variant to the canonical shape.
+ *
+ * Canonical shapes:
+ *   tree      : { kind:"tree",      root:{value,label?,left?,right?} }
+ *   list      : { kind:"list",      items:[{value}], terminator? }
+ *   stack     : { kind:"stack",     items:[{value}] }
+ *   queue     : { kind:"queue",     items:[{value}] }
+ *   graph     : { kind:"graph",     nodes:[{id,label?}], edges:[{from,to,weight?}], directed? }
+ *   hashTable : { kind:"hashTable", buckets:[{index,items:[{value}]}] }
+ *   ascii     : { kind:"ascii",     text:"..." }
+ */
+function normalizeDiagram(d) {
+  if (!d || typeof d !== "object") return d;
+
+  // Normalise kind (model may use "type" instead of "kind").
+  const rawKind = (d.kind || d.type || "ascii").toString().toLowerCase().trim();
+
+  // Kind alias map (mirrors ConceptDiagrams.normaliseKind).
+  const KIND = {
+    linkedlist: "list", "linked-list": "list", "linked list": "list",
+    "hash-table": "hashTable", "hash table": "hashTable", hashtable: "hashTable", map: "hashTable",
+    binarytree: "tree", "binary-tree": "tree", "binary tree": "tree",
+    bst: "tree", avl: "tree", heap: "tree", trie: "tree",
+    redblack: "tree", redblacktree: "tree", btree: "tree", "b-tree": "tree",
+  };
+  const kind = KIND[rawKind] || rawKind;
+  const base = { ...d, kind };
+
+  // ── Tree ───────────────────────────────────────────────────────────────
+  if (kind === "tree") {
+    // Already canonical.
+    if (base.root && typeof base.root === "object") return base;
+    // { structure: [{label, value, children:[...]}] }  ← GPT-OSS variant.
+    if (Array.isArray(base.structure) && base.structure.length > 0) {
+      base.root = _structureNodeToRoot(base.structure[0]);
+      delete base.structure;
+      return base;
+    }
+    // { nodes: [{id, label, parentId?}] }  ← adjacency-list variant.
+    if (Array.isArray(base.nodes) && base.nodes.length > 0 && !base.edges) {
+      base.root = _adjacencyNodesToRoot(base.nodes);
+      delete base.nodes;
+      return base;
+    }
+    // Single-value shorthand: { kind:"tree", value:"50" }.
+    if (typeof base.value === "string") {
+      base.root = { value: base.value };
+      return base;
+    }
+    // Unknown tree format — fall through as-is; renderer will JSON.stringify.
+    return base;
+  }
+
+  // ── List / Stack / Queue ───────────────────────────────────────────────
+  if (kind === "list" || kind === "stack" || kind === "queue") {
+    if (Array.isArray(base.items)) return base;
+    const rawArr = base.elements || base.values || base.nodes || [];
+    base.items = (Array.isArray(rawArr) ? rawArr : []).map((x) =>
+      x && typeof x === "object" ? x : { value: String(x) }
+    );
+    return base;
+  }
+
+  // ── Graph ──────────────────────────────────────────────────────────────
+  if (kind === "graph") {
+    if (Array.isArray(base.nodes)) return base;
+  }
+
+  // ── Hash Table ─────────────────────────────────────────────────────────
+  if (kind === "hashTable") {
+    if (Array.isArray(base.buckets)) return base;
+    if (base.buckets && typeof base.buckets === "object") {
+      base.buckets = Object.entries(base.buckets).map(([k, v]) => ({
+        index: parseInt(k, 10) || 0,
+        items: Array.isArray(v) ? v.map((x) =>
+          x && typeof x === "object" ? x : { value: String(x) }
+        ) : [],
+      }));
+      return base;
+    }
+  }
+
+  return base;
+}
+
+/** Recursively converts a { label, value, children:[...] } node. */
+function _structureNodeToRoot(node) {
+  if (!node) return null;
+  const value = String(node.value ?? node.label ?? node.name ?? node.text ?? "?");
+  const label = (node.label && node.label !== value) ? node.label : undefined;
+  const children = Array.isArray(node.children) ? node.children : [];
+  const out = { value };
+  if (label) out.label = label;
+  if (children[0]) out.left  = _structureNodeToRoot(children[0]);
+  if (children[1]) out.right = _structureNodeToRoot(children[1]);
+  return out;
+}
+
+/** Converts flat adjacency-list nodes (with parentId) into a nested root. */
+function _adjacencyNodesToRoot(nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) return { value: "?" };
+  const map = {};
+  nodes.forEach((n) => { map[n.id ?? n.value] = { ...n, _ch: [] }; });
+  let root = null;
+  nodes.forEach((n) => {
+    const key = n.id ?? n.value;
+    if (n.parentId != null && map[n.parentId]) {
+      map[n.parentId]._ch.push(map[key]);
+    } else {
+      root = map[key];
+    }
+  });
+  if (!root) root = map[Object.keys(map)[0]];
+  return _adjacencyNodeToRoot(root);
+}
+function _adjacencyNodeToRoot(node) {
+  if (!node) return null;
+  const out = { value: String(node.value ?? node.label ?? node.id ?? "?") };
+  if (node.label && node.label !== out.value) out.label = node.label;
+  const ch = node._ch || [];
+  if (ch[0]) out.left  = _adjacencyNodeToRoot(ch[0]);
+  if (ch[1]) out.right = _adjacencyNodeToRoot(ch[1]);
+  return out;
+}
 
 /**
  * Robust extractor for "JSON object somewhere inside an LLM reply".
