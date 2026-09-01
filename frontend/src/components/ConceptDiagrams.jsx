@@ -62,36 +62,41 @@ export function DiagramView({ diagram, label, accent = "#a78bfa" }) {
 
   if (typeof diagram !== "object") return null;
 
-  // The LLM occasionally uses `type` instead of `kind`. Be permissive.
-  const rawKind = (diagram.kind || diagram.type || "ascii").toString().toLowerCase();
+  // Normalize model/cached variants before dispatching to the SVG renderers.
+  // This keeps the renderer compatible with both the intended kind/root
+  // format and older responses such as type/structure/children.
+  const normalizedDiagram = normalizeDiagramForRenderer(diagram);
+  const rawKind = (normalizedDiagram.kind || normalizedDiagram.type || "ascii")
+    .toString()
+    .toLowerCase();
   const kind = normaliseKind(rawKind);
 
   let body = null;
   switch (kind) {
     case "tree":
-      body = diagram.root ? <TreeDiagram root={diagram.root} accent={accent} /> : null;
+      body = normalizedDiagram.root ? <TreeDiagram root={normalizedDiagram.root} accent={accent} /> : null;
       break;
     case "list":
       body = (
         <ListDiagram
-          items={readItems(diagram)}
-          terminator={diagram.terminator || diagram.endsWith || "NULL"}
+          items={readItems(normalizedDiagram)}
+          terminator={normalizedDiagram.terminator || normalizedDiagram.endsWith || "NULL"}
           accent={accent}
         />
       );
       break;
     case "stack":
-      body = <StackDiagram items={readItems(diagram)} accent={accent} />;
+      body = <StackDiagram items={readItems(normalizedDiagram)} accent={accent} />;
       break;
     case "queue":
-      body = <QueueDiagram items={readItems(diagram)} accent={accent} />;
+      body = <QueueDiagram items={readItems(normalizedDiagram)} accent={accent} />;
       break;
     case "graph":
       body = (
         <GraphDiagram
-          nodes={diagram.nodes || []}
-          edges={diagram.edges || []}
-          directed={Boolean(diagram.directed)}
+          nodes={normalizedDiagram.nodes || []}
+          edges={normalizedDiagram.edges || []}
+          directed={Boolean(normalizedDiagram.directed)}
           accent={accent}
         />
       );
@@ -99,7 +104,7 @@ export function DiagramView({ diagram, label, accent = "#a78bfa" }) {
     case "hashtable":
       body = (
         <HashTableDiagram
-          buckets={readBuckets(diagram)}
+          buckets={readBuckets(normalizedDiagram)}
           accent={accent}
         />
       );
@@ -109,11 +114,11 @@ export function DiagramView({ diagram, label, accent = "#a78bfa" }) {
       body = (
         <AsciiDiagram
           text={
-            diagram.text ||
-            diagram.ascii ||
+            normalizedDiagram.text ||
+            normalizedDiagram.ascii ||
             // last-resort: stringify the whole thing so the user can
             // at least see the data, instead of a blank pane.
-            JSON.stringify(diagram, null, 2)
+            JSON.stringify(normalizedDiagram, null, 2)
           }
         />
       );
@@ -125,7 +130,7 @@ export function DiagramView({ diagram, label, accent = "#a78bfa" }) {
   if (!body) {
     body = (
       <AsciiDiagram
-        text={diagram.text || JSON.stringify(diagram, null, 2)}
+        text={normalizedDiagram.text || JSON.stringify(normalizedDiagram, null, 2)}
       />
     );
   }
@@ -133,8 +138,8 @@ export function DiagramView({ diagram, label, accent = "#a78bfa" }) {
   return (
     <DiagramShell
       label={label}
-      caption={diagram.caption}
-      rule={diagram.rule}
+      caption={normalizedDiagram.caption}
+      rule={normalizedDiagram.rule}
       accent={accent}
     >
       {body}
@@ -1088,6 +1093,170 @@ function AsciiDiagram({ text }) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+function normalizeDiagramForRenderer(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return input;
+
+  const rawKind = String(input.kind ?? input.type ?? inferDiagramKind(input)).toLowerCase().trim();
+  const kind = normaliseKind(rawKind);
+  const out = { ...input, kind };
+
+  if (kind === "tree") {
+    if (out.root && typeof out.root === "object") {
+      out.root = normalizeTreeNode(out.root);
+      return out;
+    }
+
+    // GPT-OSS / older responses sometimes return:
+    // { type:"tree", structure:[{ value, children:[...] }, ...] }
+    if (Array.isArray(out.structure) && out.structure.length) {
+      out.root = normalizeTreeNode(out.structure[0]);
+      delete out.structure;
+      return out;
+    }
+
+    // Some responses put the actual tree under `tree`.
+    if (out.tree && typeof out.tree === "object") {
+      const treeRoot = out.tree.root ?? out.tree;
+      out.root = normalizeTreeNode(treeRoot);
+      delete out.tree;
+      return out;
+    }
+
+    // Flat nodes with parentId can also be converted into a binary tree.
+    if (Array.isArray(out.nodes) && out.nodes.length && !Array.isArray(out.edges)) {
+      out.root = normalizeAdjacencyTree(out.nodes);
+      delete out.nodes;
+      return out;
+    }
+
+    if (out.value != null || out.label != null || out.name != null) {
+      out.root = normalizeTreeNode(out);
+      return out;
+    }
+
+    return out;
+  }
+
+  if (kind === "list" || kind === "stack" || kind === "queue") {
+    const rawItems = out.items ?? out.elements ?? out.values ?? out.nodes ?? [];
+    out.items = normalizeItems(rawItems);
+    return out;
+  }
+
+  if (kind === "graph") {
+    out.nodes = Array.isArray(out.nodes)
+      ? out.nodes.map((node, i) =>
+          typeof node === "object" && node !== null
+            ? { ...node, id: String(node.id ?? node.key ?? node.label ?? i), label: String(node.label ?? node.id ?? node.key ?? i) }
+            : { id: String(node), label: String(node) }
+        )
+      : [];
+    out.edges = Array.isArray(out.edges)
+      ? out.edges.map((edge) => ({
+          ...edge,
+          from: String(edge?.from ?? edge?.source ?? ""),
+          to: String(edge?.to ?? edge?.target ?? ""),
+        })).filter((edge) => edge.from && edge.to)
+      : [];
+    return out;
+  }
+
+  if (kind === "hashtable") {
+    if (out.buckets && !Array.isArray(out.buckets) && typeof out.buckets === "object") {
+      out.buckets = Object.entries(out.buckets).map(([index, values]) => ({
+        index,
+        items: normalizeItems(Array.isArray(values) ? values : [values]),
+      }));
+    } else if (Array.isArray(out.buckets)) {
+      out.buckets = out.buckets.map((bucket, i) => ({
+        index: bucket?.index ?? i,
+        items: normalizeItems(bucket?.items ?? bucket?.values ?? []),
+      }));
+    }
+    return out;
+  }
+
+  if (kind === "ascii") {
+    if (!out.text && out.ascii) out.text = String(out.ascii);
+    return out;
+  }
+
+  return out;
+}
+
+function inferDiagramKind(input) {
+  if (input.root || input.structure || input.tree) return "tree";
+  if (input.items || input.elements || input.values) return "list";
+  if (input.edges && input.nodes) return "graph";
+  if (input.buckets) return "hashTable";
+  if (input.text || input.ascii) return "ascii";
+  return "ascii";
+}
+
+function normalizeTreeNode(node, seen = new Set()) {
+  if (!node || typeof node !== "object" || seen.has(node)) return null;
+  seen.add(node);
+
+  const value = String(node.value ?? node.key ?? node.name ?? node.label ?? node.text ?? "");
+  const out = { value };
+  const label = node.label ?? node.note;
+  if (label != null && String(label) !== value) out.label = String(label);
+
+  const children = Array.isArray(node.children) ? node.children : [];
+  const left = node.left ?? children[0] ?? null;
+  const right = node.right ?? children[1] ?? null;
+
+  if (left && typeof left === "object") out.left = normalizeTreeNode(left, new Set(seen));
+  if (right && typeof right === "object") out.right = normalizeTreeNode(right, new Set(seen));
+  return out;
+}
+
+function normalizeAdjacencyTree(nodes) {
+  if (!Array.isArray(nodes) || !nodes.length) return null;
+  const map = new Map();
+
+  nodes.forEach((node, index) => {
+    const id = String(node?.id ?? node?.key ?? node?.value ?? index);
+    map.set(id, { ...node, _id: id, _children: [] });
+  });
+
+  let root = null;
+  for (const node of map.values()) {
+    const parentId = node.parentId ?? node.parent ?? null;
+    if (parentId != null && map.has(String(parentId))) {
+      map.get(String(parentId))._children.push(node);
+    } else if (!root) {
+      root = node;
+    }
+  }
+
+  function convert(node) {
+    if (!node) return null;
+    const children = node._children || [];
+    return normalizeTreeNode({
+      value: node.value ?? node.label ?? node.id,
+      label: node.label,
+      children: children.slice(0, 2),
+    });
+  }
+
+  return convert(root);
+}
+
+function normalizeItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => {
+    if (item == null) return { value: "" };
+    if (typeof item === "object") {
+      return {
+        value: String(item.value ?? item.key ?? item.name ?? item.label ?? item.text ?? ""),
+        label: item.label ?? item.note ?? null,
+      };
+    }
+    return { value: String(item) };
+  });
+}
 
 function normaliseKind(rawKind) {
   if (!rawKind) return "ascii";

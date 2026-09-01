@@ -940,24 +940,29 @@ function SkeletonExplanation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Groq call — multi-model with JSON Schema Mode.
+// Groq call — multi-model JSON Object Mode.
 //
-// Primary model  : openai/gpt-oss-20b  (reasoning_effort:low, JSON Schema)
-// Fallback model : qwen/qwen3.6-27b   (reasoning_effort:none, JSON Schema
-//                                      then json_object if schema rejected)
+// We intentionally use JSON Object Mode instead of strict JSON Schema here.
+// Groq Strict Structured Outputs require every nested object to have
+// additionalProperties:false and every property to be required. The diagram
+// data is recursive and contains several optional fields, so JSON Object Mode
+// is much more reliable for this frontend feature. The response is still
+// parsed, normalized and validated locally before it reaches the UI.
+//
+// Primary model  : openai/gpt-oss-20b
+// Fallback model : qwen/qwen3.6-27b
 // ─────────────────────────────────────────────────────────────────────────
 
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 
-// Model priority: primary first, fallback second.
 const MODEL_CANDIDATES = [
   "openai/gpt-oss-20b",
   "qwen/qwen3.6-27b",
 ];
-// Prefer a dedicated concept key (separate Groq account / quota bucket).
-// Falls back to the shared key so nothing breaks if only one key is set.
-//   Primary  → VITE_GROQ_API_KEY_CONCEPT  (add to frontend/.env)
-//   Fallback → VITE_GROQ_API_KEY
+
+// Dedicated concept key. Keep this in the frontend environment as:
+// VITE_GROQ_API_KEY_CONCEPT=...
+// Falls back to the shared key if the dedicated key is not present.
 const GROQ_API_KEY_CONCEPT =
   import.meta.env.VITE_GROQ_API_KEY_CONCEPT ||
   import.meta.env.VITE_GROQ_API_KEY ||
@@ -970,11 +975,9 @@ async function callGroqForExplanation(concept, contextText) {
       "or VITE_GROQ_API_KEY in frontend/.env"
     );
   }
+
   const trimmedContext = (contextText || "").slice(0, 2000);
 
-  // ── User prompt ──────────────────────────────────────────────────────────
-  // JSON Schema Mode handles output structure, so the prompt focuses on
-  // content guidance rather than JSON formatting instructions.
   const userPrompt = `Generate a study guide for the following concept.
 
 CONCEPT: "${concept.name}"
@@ -983,95 +986,51 @@ ${concept.summary ? `SHORT SUMMARY: "${concept.summary}"` : ""}
 MEETING CONTEXT (tailor to what was discussed; ignore irrelevant parts):
 ${trimmedContext || "(no additional context provided)"}
 
+Return ONLY one valid JSON object. Do not use markdown fences. Do not add any text before or after the JSON.
+
+The JSON object MUST contain exactly these top-level fields:
+- definition: string
+- whyNeeded: string
+- realLifeExample: string
+- diagram: object
+- exampleDiagram: object
+- solvedExample: object
+- examQuestions: array of strings
+- interviewQuestions: array of strings
+
+Diagram format:
+- tree: { "kind":"tree", "root": { "value":"...", "label":"...", "left": {...}, "right": {...} } }
+- list: { "kind":"list", "items":[{"value":"..."}], "terminator":"NULL" }
+- stack: { "kind":"stack", "items":[{"value":"..."}] }
+- queue: { "kind":"queue", "items":[{"value":"..."}] }
+- graph: { "kind":"graph", "nodes":[{"id":"...","label":"..."}], "edges":[{"from":"...","to":"...","weight":"..."}], "directed":false }
+- hash table: { "kind":"hashTable", "buckets":[{"index":0,"items":[{"value":"..."}]}] }
+- ascii: { "kind":"ascii", "text":"..." }
+
+For tree diagrams, use nested left/right children. If a model instead uses type/structure/children, the application will normalize it, but prefer kind/root in your response.
+
+Solved example format:
+{
+  "question":"...",
+  "steps":[
+    {"title":"...","explanation":"...","diagram":{...}}
+  ],
+  "finalAnswer":"...",
+  "beginnerTip":"..."
+}
+
 Guidelines:
 - definition: 2-4 clear beginner-friendly sentences.
 - whyNeeded: 2-4 sentences explaining the motivation / problem it solves.
 - realLifeExample: 2-4 concrete relatable sentences, no jargon.
-- diagram: choose tree/list/stack/queue/graph/hashTable/ascii that best shows the concept structure with teaching labels (Root, Left Child, Leaf, etc.).
-- exampleDiagram: same kind as diagram with concrete realistic values (numbers, names, cities).
-- solvedExample: 3-4 steps max. Each step does ONE small operation. Include a diagram in steps where a visual snapshot helps (omit the diagram key entirely otherwise). Keep the worked example small (at most 4 numbers/rows/processes).
+- diagram: choose tree/list/stack/queue/graph/hashTable/ascii that best shows the concept structure with teaching labels.
+- exampleDiagram: same kind as diagram with concrete realistic values.
+- solvedExample: 3-4 steps maximum. Each step does ONE small operation. Include a diagram in steps where a visual snapshot helps; otherwise omit the diagram field for that step. Keep the worked example small (at most 4 numbers/rows/processes).
 - examQuestions: exactly 3 short academic-style questions.
 - interviewQuestions: exactly 3 short industry/behavioural questions.
-- Keep everything concise. Beginner-friendly language throughout.
+- Keep everything concise and beginner-friendly.
 `;
 
-  // ── JSON Schema for response_format:json_schema ───────────────────────
-  // Proper JSON Schema object — no pseudo-syntax, no comments inside.
-  // Diagram uses a single flexible object (kind + optional per-kind fields)
-  // rather than anyOf, which some models handle poorly under strict mode.
-  const diagramSchema = {
-    type: "object",
-    description: "Visual diagram. Set kind to: tree, list, stack, queue, graph, hashTable, or ascii.",
-    properties: {
-      kind: { type: "string", enum: ["tree","list","stack","queue","graph","hashTable","ascii"] },
-      rule: { type: "string" },
-      root:  { type: "object", properties: { value:{type:"string"}, label:{type:"string"}, left:{type:"object"}, right:{type:"object"} }, required:["value"] },
-      items: { type: "array",  items: { type:"object", properties:{value:{type:"string"}}, required:["value"] } },
-      terminator: { type: "string" },
-      nodes: { type: "array",  items: { type:"object", properties:{id:{type:"string"},label:{type:"string"}}, required:["id"] } },
-      edges: { type: "array",  items: { type:"object", properties:{from:{type:"string"},to:{type:"string"},weight:{type:"string"}}, required:["from","to"] } },
-      directed: { type: "boolean" },
-      buckets:  { type: "array",  items: { type:"object", properties:{index:{type:"integer"},items:{type:"array",items:{type:"object",properties:{value:{type:"string"}},required:["value"]}}}, required:["index","items"] } },
-      text: { type: "string" }
-    },
-    required: ["kind"]
-  };
-
-  const stepSchema = {
-    type: "object",
-    properties: {
-      title:       { type: "string" },
-      explanation: { type: "string" },
-      diagram:     diagramSchema
-    },
-    required: ["title", "explanation"]
-  };
-
-  const topLevelSchema = {
-    type: "object",
-    properties: {
-      definition:         { type: "string" },
-      whyNeeded:          { type: "string" },
-      realLifeExample:    { type: "string" },
-      diagram:            diagramSchema,
-      exampleDiagram:     diagramSchema,
-      solvedExample: {
-        type: "object",
-        properties: {
-          question:    { type: "string" },
-          steps:       { type: "array", items: stepSchema },
-          finalAnswer: { type: "string" },
-          beginnerTip: { type: "string" }
-        },
-        required: ["question","steps","finalAnswer","beginnerTip"]
-      },
-      examQuestions:      { type: "array", items: { type: "string" } },
-      interviewQuestions: { type: "array", items: { type: "string" } }
-    },
-    required: [
-      "definition","whyNeeded","realLifeExample",
-      "diagram","exampleDiagram","solvedExample",
-      "examQuestions","interviewQuestions"
-    ],
-    additionalProperties: false
-  };
-
-  const jsonSchemaResponseFormat = {
-    type: "json_schema",
-    json_schema: {
-      name: "concept_study_guide",
-      strict: true,
-      schema: topLevelSchema
-    }
-  };
-
-  // ── System prompt ─────────────────────────────────────────────────────
-  const systemPrompt =
-    "You are a precise computer-science teacher generating a structured study guide. " +
-    "Follow the supplied JSON schema exactly. Use beginner-friendly explanations. " +
-    "Choose the diagram type that best represents the concept. Keep the response concise.";
-
-  // ── Attempt each model in priority order ──────────────────────────────
   let lastError = null;
 
   for (const model of MODEL_CANDIDATES) {
@@ -1080,24 +1039,26 @@ Guidelines:
     const requestBody = {
       model,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: userPrompt },
+        {
+          role: "system",
+          content:
+            "You are a precise computer-science teacher. Return only valid JSON. " +
+            "Follow the requested object structure exactly. Never return markdown or prose outside the JSON object.",
+        },
+        { role: "user", content: userPrompt },
       ],
       temperature: 0.2,
       max_completion_tokens: 3000,
-      response_format: jsonSchemaResponseFormat,
+      response_format: { type: "json_object" },
     };
 
     if (isGptOss) {
-      // GPT-OSS: low reasoning effort, suppress reasoning tokens from output.
-      requestBody.reasoning_effort  = "low";
+      requestBody.reasoning_effort = "low";
       requestBody.include_reasoning = false;
     } else {
-      // Qwen: disable built-in chain-of-thought to avoid <think> blocks.
       requestBody.reasoning_effort = "none";
     }
 
-    // Attempt 1: JSON Schema Mode.
     try {
       const result = await attemptGroqRequest(requestBody, model, concept);
       if (result !== null) return result;
@@ -1107,32 +1068,21 @@ Guidelines:
       console.error("[ConceptDrawer] Model failed:", {
         model,
         concept: concept?.name,
-        error: err.message?.slice(0, 500),
+        status: err.status || null,
+        code: err.code || null,
+        error: err.message?.slice(0, 1000),
       });
 
-      if (isGptOss) continue; // GPT-OSS: no json_object retry, try next model.
-
-      // Qwen: retry once with plain json_object mode if schema was rejected.
-      console.warn(`[ConceptDrawer] ${model}: JSON Schema Mode failed — retrying with json_object mode.`);
-      const fallbackBody = { ...requestBody, response_format: { type: "json_object" } };
-
-      try {
-        const result = await attemptGroqRequest(fallbackBody, model, concept);
-        if (result !== null) return result;
-        lastError = new Error(`${model} (json_object): response failed validation`);
-      } catch (err2) {
-        lastError = err2;
-        console.error("[ConceptDrawer] Model failed (json_object retry):", {
-          model,
-          concept: concept?.name,
-          error: err2.message?.slice(0, 500),
-        });
-      }
+      // Try the next model. This is important for 429 rate limits and other
+      // model-specific failures. We do not retry the same request repeatedly.
+      continue;
     }
   }
 
-  console.error("[ConceptDrawer] All models failed. Last error:", lastError?.message);
-  throw new Error("AI concept generation failed. Please try Regenerate.");
+  console.error("[ConceptDrawer] All models failed. Last error:", lastError);
+  throw new Error(
+    lastError?.message || "AI concept generation failed. Please try Regenerate."
+  );
 }
 
 /**
@@ -1160,7 +1110,22 @@ async function attemptGroqRequest(requestBody, model, concept) {
       concept: concept?.name,
       error: errorText?.slice(0, 1000),
     });
-    throw new Error(`Groq ${res.status} (${model}): ${errorText.slice(0, 300)}`);
+    let detail = errorText;
+    try {
+      const parsedError = JSON.parse(errorText);
+      detail = parsedError?.error?.message || parsedError?.message || errorText;
+    } catch (_) {
+      // Keep raw text when Groq did not return JSON.
+    }
+    const err = new Error(`Groq ${res.status} (${model}): ${String(detail).slice(0, 500)}`);
+    err.status = res.status;
+    try {
+      const parsedError = JSON.parse(errorText);
+      err.code = parsedError?.error?.code || null;
+    } catch (_) {
+      err.code = null;
+    }
+    throw err;
   }
 
   const data = await res.json();
