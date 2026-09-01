@@ -334,6 +334,14 @@ function TreeDiagram({ root, accent }) {
 }
 
 function TreeNode({ x, y, w, h, value, label, accent }) {
+  // FIX (part 2): long values were overflowing the node's rounded-rect
+  // body because the text was drawn at a fixed/estimated font size with
+  // no regard for the box width. truncateForWidth() clips the string to
+  // whatever actually fits inside `w` (minus a little padding) and adds
+  // an ellipsis, so text now stays inside the shape instead of spilling
+  // past its edges.
+  const fontSize = value && String(value).length > 8 ? 10 : 12;
+  const displayValue = truncateForWidth(value, w, fontSize);
   return (
     <g transform={`translate(${x}, ${y})`}>
       <rect
@@ -349,12 +357,12 @@ function TreeNode({ x, y, w, h, value, label, accent }) {
         x={w / 2}
         y={h / 2 + 4}
         textAnchor="middle"
-        fontSize={value && String(value).length > 8 ? 10 : 12}
+        fontSize={fontSize}
         fontWeight={600}
         fill="#e2e8f0"
         fontFamily="ui-sans-serif, system-ui, sans-serif"
       >
-        {String(value ?? "")}
+        {displayValue}
       </text>
       {label ? (
         <text
@@ -533,6 +541,12 @@ function ListDiagram({ items, terminator, accent }) {
 }
 
 function BoxNode({ x, y, w, h, value, label, accent }) {
+  // FIX (part 2): same overflow issue as TreeNode — a long value
+  // (e.g. a full sentence like "Win a free iPhone now! Click here")
+  // rendered at fixed font size ran outside the box. Clip to what
+  // actually fits in `w` and show "…" instead of spilling over.
+  const fontSize = value && String(value).length > 8 ? 10 : 12;
+  const displayValue = truncateForWidth(value, w, fontSize);
   return (
     <g transform={`translate(${x}, ${y})`}>
       <rect
@@ -548,12 +562,12 @@ function BoxNode({ x, y, w, h, value, label, accent }) {
         x={w / 2}
         y={h / 2 + 4}
         textAnchor="middle"
-        fontSize={value && String(value).length > 8 ? 10 : 12}
+        fontSize={fontSize}
         fontWeight={600}
         fill="#e2e8f0"
         fontFamily="ui-sans-serif, system-ui, sans-serif"
       >
-        {String(value ?? "")}
+        {displayValue}
       </text>
       {label ? (
         <text
@@ -1120,6 +1134,19 @@ function estimateTextWidth(text, fontSize = 12) {
   // because it's better to have a too-wide node than a label that
   // overflows the box.
   return Math.ceil(String(text || "").length * fontSize * 0.62);
+}
+
+// FIX (part 1): new helper. Clips a value to however many characters
+// actually fit inside a box of width `maxWidth` at the given font size,
+// appending "…" when truncated. Used by TreeNode and BoxNode so long
+// LLM-generated values (full sentences, long phrases) never render
+// past the edges of their node shape.
+function truncateForWidth(text, maxWidth, fontSize = 12) {
+  const str = String(text ?? "");
+  const charW = fontSize * 0.62;
+  const maxChars = Math.max(1, Math.floor((maxWidth - 8) / charW));
+  if (str.length <= maxChars) return str;
+  return str.slice(0, Math.max(0, maxChars - 1)) + "…";
 }
 
 function clamp(n, lo, hi) {
