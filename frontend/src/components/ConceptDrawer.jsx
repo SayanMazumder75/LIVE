@@ -1269,17 +1269,20 @@ function normalizeDiagram(d) {
 
   // ── Tree ───────────────────────────────────────────────────────────────
   if (kind === "tree") {
-    // Already canonical.
-    if (base.root && typeof base.root === "object") return base;
+    // Already canonical — just prune depth.
+    if (base.root && typeof base.root === "object") {
+      base.root = _pruneTreeDepth(base.root, 3);
+      return base;
+    }
     // { structure: [{label, value, children:[...]}] }  ← GPT-OSS variant.
     if (Array.isArray(base.structure) && base.structure.length > 0) {
-      base.root = _structureNodeToRoot(base.structure[0]);
+      base.root = _pruneTreeDepth(_structureNodeToRoot(base.structure[0]), 3);
       delete base.structure;
       return base;
     }
     // { nodes: [{id, label, parentId?}] }  ← adjacency-list variant.
     if (Array.isArray(base.nodes) && base.nodes.length > 0 && !base.edges) {
-      base.root = _adjacencyNodesToRoot(base.nodes);
+      base.root = _pruneTreeDepth(_adjacencyNodesToRoot(base.nodes), 3);
       delete base.nodes;
       return base;
     }
@@ -1322,6 +1325,20 @@ function normalizeDiagram(d) {
   }
 
   return base;
+}
+
+/**
+ * Prunes a canonical tree node so it is at most maxDepth levels deep.
+ * Keeps the tree drawable in a fixed-height viewport — a depth-4+ tree
+ * can have 15+ nodes and make the SVG too wide to read in the drawer.
+ */
+function _pruneTreeDepth(node, maxDepth) {
+  if (!node || maxDepth <= 0) return node ? { value: node.value, label: node.label } : null;
+  const out = { value: node.value };
+  if (node.label) out.label = node.label;
+  if (node.left)  out.left  = _pruneTreeDepth(node.left,  maxDepth - 1);
+  if (node.right) out.right = _pruneTreeDepth(node.right, maxDepth - 1);
+  return out;
 }
 
 /** Recursively converts a { label, value, children:[...] } node. */

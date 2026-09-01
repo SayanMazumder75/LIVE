@@ -187,9 +187,10 @@ function DiagramShell({ label, caption, rule, accent, children }) {
           borderRadius: 8,
           padding: "12px 14px",
           overflowX: "auto",
-          // Gives the SVG breathing room and keeps long ASCII art
-          // scrollable instead of squished.
-          minHeight: 120,
+          overflowY: "hidden",
+          // Enough vertical space so multi-level trees are always legible
+          // even after proportional width-shrink inside the narrow drawer.
+          minHeight: 200,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -243,11 +244,11 @@ function TreeDiagram({ root, accent }) {
       Math.max(estimateTextWidth(n.value), estimateTextWidth(n.label || ""))
     )
   );
-  const NODE_W = clamp(maxWidth + 20, 56, 160);
-  const NODE_H = 36;
-  const COL_GAP = 28;
-  const ROW_GAP = 50;
-  const PAD = 12;
+  const NODE_W = clamp(maxWidth + 24, 64, 160);
+  const NODE_H = 40;
+  const COL_GAP = 32;
+  const ROW_GAP = 56;
+  const PAD = 14;
 
   const cols = layout.maxX + 1;
   const rows = layout.maxDepth + 1;
@@ -286,7 +287,17 @@ function TreeDiagram({ root, accent }) {
   return (
     <svg
       viewBox={`0 0 ${width} ${height}`}
-      style={{ width: "100%", maxWidth: width, height: "auto" }}
+      style={{
+        // width:100% lets the SVG fill its container horizontally; the
+        // container has overflowX:auto so a very wide tree scrolls rather
+        // than being squished. minWidth prevents the SVG from collapsing
+        // so small that text becomes unreadable on a narrow container.
+        width: "100%",
+        minWidth: Math.min(width, 320),
+        maxWidth: width,
+        height: "auto",
+        minHeight: height,
+      }}
       role="img"
       aria-label="Tree diagram"
     >
