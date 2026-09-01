@@ -963,235 +963,169 @@ async function callGroqForExplanation(concept, contextText) {
     );
   }
   const trimmedContext = (contextText || "").slice(0, 2000);
-  const prompt = `You are a teacher creating a one-shot study guide for the term below.
 
-Return ONLY valid JSON (no markdown, no prose around it). Use this EXACT shape:
+  // ── Prompt ──────────────────────────────────────────────────────────────
+  // IMPORTANT: Do NOT use pseudo-JSON placeholders like <DIAGRAM-OBJECT>
+  // inside the JSON template. Groq validates the prompt when
+  // response_format:json_object is set, and angle-bracket tokens inside
+  // the JSON template cause the request to be rejected before the model
+  // even runs. Instead, every schema position uses a concrete, valid JSON
+  // value (string, number, object, array) so the prompt is itself valid
+  // JSON-representable. The actual JSON output is extracted via
+  // extractJsonObject() which handles markdown fences and prose preamble.
+  const prompt = `You are a teacher creating a one-shot study guide for a concept from a meeting.
+
+Return ONLY a single JSON object. No markdown fences, no prose before or after the JSON.
+The object MUST have exactly these top-level keys:
+
 {
-  "definition": "A clear, beginner-friendly definition in 2-4 sentences.",
-  "whyNeeded": "Why this concept is needed / what problem it solves, in 2-4 sentences.",
-  "realLifeExample": "A concrete relatable example, in 2-4 sentences. Avoid jargon.",
-  "diagram": <DIAGRAM-OBJECT for the concept structure (see DIAGRAM SPEC below)>,
-  "exampleDiagram": <DIAGRAM-OBJECT for a real example with concrete values>,
-  "solvedExample": <SOLVED-EXAMPLE-OBJECT (see SOLVED EXAMPLE SPEC below)>,
-  "examQuestions": ["short academic-style question 1", "...", "...", "..."],
-  "interviewQuestions": ["short industry / behavioural question 1", "...", "...", "..."]
+  "definition": "string — clear beginner-friendly definition, 2-4 sentences",
+  "whyNeeded": "string — motivation / problem it solves, 2-4 sentences",
+  "realLifeExample": "string — concrete relatable scenario, 2-4 sentences, no jargon",
+  "diagram": { ... },
+  "exampleDiagram": { ... },
+  "solvedExample": { ... },
+  "examQuestions": ["string", "string", "string"],
+  "interviewQuestions": ["string", "string", "string"]
 }
 
 Generate 3-5 exam questions and 3-5 interview questions.
 
-────────────────────────────────────────
-DIAGRAM SPEC
-────────────────────────────────────────
-A DIAGRAM-OBJECT is one of the following JSON shapes — pick whichever
-best fits the concept. Output STRUCTURED data, NOT ascii art (the
-frontend renders proper SVG from this). Always include a one-line
-"rule" string that captures the main teaching point.
+════════════════════════════════════════
+DIAGRAM SCHEMA
+════════════════════════════════════════
+The "diagram" field (Concept Structure — teaching labels) and the
+"exampleDiagram" field (Real Example — concrete values) must each be
+one of the JSON objects below. Pick whichever kind best fits the concept.
+Always include a short "rule" string.
 
-(a) Tree (Binary Tree, BST, AVL, Heap, Red-Black, B-Tree, Trie, etc.):
-{
-  "kind": "tree",
-  "root": {
-    "value": "Root",
-    "label": "optional sub-label, e.g. balance:0",
-    "left":  { "value": "Left",  "left": {...}, "right": {...} },
-    "right": { "value": "Right", "left": {...}, "right": {...} }
+• tree  — Binary Tree / BST / AVL / Heap / Trie / B-Tree
+  "diagram": {
+    "kind": "tree",
+    "root": {
+      "value": "Root",
+      "left":  { "value": "Left Child",  "left": { "value": "Leaf" }, "right": { "value": "Leaf" } },
+      "right": { "value": "Right Child", "left": { "value": "Leaf" }, "right": { "value": "Leaf" } }
+    },
+    "rule": "Each node has up to two children: left and right"
   },
-  "rule": "Left < Parent < Right"
-}
-- For the CONCEPT STRUCTURE, use educational placeholder values:
-  "Root", "Left Child", "Right Child", "Leaf", "Internal Node", etc.,
-  so beginners learn the terminology.
-- For the REAL EXAMPLE, use concrete realistic numbers / strings.
-  Show 5-7 nodes total. Always include EVERY child (don't omit
-  the right subtree).
-
-(b) Linked List:
-{
-  "kind": "list",
-  "items": [{"value":"3"},{"value":"7"},{"value":"12"}],
-  "terminator": "NULL",
-  "rule": "Each node points to the next; tail points to NULL"
-}
-
-(c) Stack:
-{
-  "kind": "stack",
-  "items": [{"value":"7"},{"value":"4"},{"value":"9"},{"value":"2"}],   // index 0 is the TOP
-  "rule": "LIFO — last item pushed is first popped"
-}
-
-(d) Queue:
-{
-  "kind": "queue",
-  "items": [{"value":"A"},{"value":"B"},{"value":"C"}],   // index 0 is the FRONT
-  "rule": "FIFO — first item enqueued is first dequeued"
-}
-
-(e) Graph / Network Topology:
-{
-  "kind": "graph",
-  "nodes": [{"id":"A"},{"id":"B"},{"id":"C"},{"id":"D"}],
-  "edges": [
-    {"from":"A","to":"B","weight":"5"},
-    {"from":"B","to":"C","weight":"3"},
-    {"from":"C","to":"D"}
-  ],
-  "directed": false,
-  "rule": "Vertices V connected by edges E; edges may be weighted"
-}
-- Real example for graphs / networks should use named cities or
-  routers (e.g. "Delhi","Mumbai","Pune","Chennai") with edge weights.
-
-(f) Hash Table:
-{
-  "kind": "hashTable",
-  "buckets": [
-    {"index":0, "items":[]},
-    {"index":1, "items":[{"value":"Alice"},{"value":"Bob"}]},
-    {"index":2, "items":[]},
-    {"index":3, "items":[{"value":"Carol"}]}
-  ],
-  "rule": "hash(key) → bucket index; collisions chain in the bucket"
-}
-
-(g) ASCII fallback (only if NONE of the above fit):
-{
-  "kind": "ascii",
-  "text": "raw monospace diagram preserving all whitespace",
-  "rule": "..."
-}
-
-Both "diagram" and "exampleDiagram" MUST follow the same DIAGRAM SPEC.
-The CONCEPT STRUCTURE teaches terminology with educational labels;
-the REAL EXAMPLE teaches the same shape with simpler concrete values.
-Both should include their own short "rule" line.
-
-────────────────────────────────────────
-SOLVED EXAMPLE SPEC
-────────────────────────────────────────
-A SOLVED-EXAMPLE-OBJECT is a small worked problem a first-year
-student could read and follow:
-
-{
-  "question": "One short exam-style question (1-2 sentences).",
-  "steps": [
-    {
-      "title": "Step 1: Insert 50",
-      "explanation": "50 becomes the root since the tree is empty.",
-      "diagram": <DIAGRAM-OBJECT or null>   // optional — include when a snapshot of the data structure helps
+  "exampleDiagram": {
+    "kind": "tree",
+    "root": {
+      "value": "50",
+      "left":  { "value": "30", "left": { "value": "20" }, "right": { "value": "40" } },
+      "right": { "value": "70", "left": { "value": "60" }, "right": { "value": "80" } }
     },
-    {
-      "title": "Step 2: Insert 30",
-      "explanation": "30 < 50, so it goes to the left of the root.",
-      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value": "30"} } }
-    }
-  ],
-  "finalAnswer": "The single-sentence final answer / final state.",
-  "beginnerTip": "One-line key takeaway that helps avoid the most common beginner mistake."
-}
+    "rule": "Left child < parent < right child"
+  }
+  NOTE: Omit a missing child key entirely — do NOT write null or {}.
 
-REQUIREMENTS for Solved Example:
-- Generate 3-6 small steps. Steps should be tiny — each one does
-  ONE thing.
-- For each step, write a 1-2 sentence beginner-friendly explanation
-  in plain language. No jargon.
-- Include diagrams in steps that benefit from a visual snapshot
-  (data-structure operations, table-state changes, scheduling
-  decisions, packet flow). Skip the diagram for purely-prose steps
-  (e.g. "compare keys", "look up index").
-- Each step's diagram MUST be a full DIAGRAM-OBJECT following the
-  DIAGRAM SPEC above — do NOT use ascii inside steps.
-- Keep the example small and concrete (≤ 4 numbers / rows / processes).
-- finalAnswer is one short sentence.
-- beginnerTip is one short sentence — the rule of thumb.
+• list  — Linked List
+  "diagram": {
+    "kind": "list",
+    "items": [ { "value": "Node A" }, { "value": "Node B" }, { "value": "Node C" } ],
+    "terminator": "NULL",
+    "rule": "Each node holds data and a pointer to the next node"
+  }
 
-TOPIC-SPECIFIC GUIDANCE for Solved Example:
-- DSA (Tree / BST / AVL / Heap / Linked List / Stack / Queue / Trie / Graph):
-    Show insertion / deletion / search step-by-step with the data
-    structure evolving in each step's diagram.
-    Example: 'Insert 50, 30, 70, 20 into an empty BST' → 4 steps,
-    each with a diagram of the BST after that insertion.
-- DBMS / Database Relationships:
-    Show small tables (kind:'ascii' for table grids is OK here, or
-    kind:'list' for short row sequences) and SQL/operation steps.
-    Example: 'Apply σ_age>18(STUDENTS) on a 4-row table' → step 1
-    shows the table, step 2 shows the predicate evaluated row-by-row,
-    step 3 shows the resulting subset.
-- OS Scheduling:
-    Show the Gantt chart progressing one quantum at a time, or the
-    ready/blocked queues evolving. Use kind:'queue' for ready
-    queues and kind:'ascii' for Gantt charts.
-    Example: 'Schedule P1(2ms), P2(5ms), P3(1ms) under FCFS' → step
-    1 shows arrival, step 2 dispatches P1, etc.
-- Networking / Routing:
-    Show the packet's hop-by-hop journey or the routing-table
-    lookup. Use kind:'graph' with directed edges for hop traces.
-    Example: 'Trace packet from Delhi to Chennai through this
-    network' → each step shows the current hop highlighted on the
-    graph.
-- Concepts with no obvious worked example (e.g. abstract
-  philosophy, broad survey terms): use the realLifeExample as a
-  jumping-off point and walk through it analytically; diagrams are
-  optional in this case.
-────────────────────────────────────────
-"diagram": {
-  "kind": "tree",
-  "root": {
-    "value": "Root",
-    "left":  { "value": "Left Child",  "left":{"value":"Leaf"}, "right":{"value":"Leaf"} },
-    "right": { "value": "Right Child", "left":{"value":"Leaf"}, "right":{"value":"Leaf"} }
-  },
-  "rule": "Each node has up to 2 children: left and right"
-},
-"exampleDiagram": {
-  "kind": "tree",
-  "root": {
-    "value": "50",
-    "left":  { "value": "30", "left": {"value":"20"}, "right": {"value":"40"} },
-    "right": { "value": "70", "left": {"value":"60"}, "right": {"value":"80"} }
-  },
-  "rule": "Left < Parent < Right"
-},
-"solvedExample": {
-  "question": "Insert 50, 30, 70, 20 into an empty BST. Show the tree after each insertion.",
-  "steps": [
-    {
-      "title": "Step 1: Insert 50",
-      "explanation": "The tree is empty, so 50 becomes the root.",
-      "diagram": { "kind": "tree", "root": { "value": "50" } }
-    },
-    {
-      "title": "Step 2: Insert 30",
-      "explanation": "30 < 50, so it goes to the LEFT of the root.",
-      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value":"30"} } }
-    },
-    {
-      "title": "Step 3: Insert 70",
-      "explanation": "70 > 50, so it goes to the RIGHT of the root.",
-      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value":"30"}, "right": {"value":"70"} } }
-    },
-    {
-      "title": "Step 4: Insert 20",
-      "explanation": "20 < 50 → go left. 20 < 30 → go left of 30. Place there.",
-      "diagram": { "kind": "tree", "root": { "value": "50", "left": {"value":"30", "left": {"value":"20"}}, "right": {"value":"70"} } }
-    }
-  ],
-  "finalAnswer": "Final BST has root 50 with 30 (left) and 70 (right); 20 hangs under 30 on the left.",
-  "beginnerTip": "Always start at the root: smaller goes left, larger goes right, then repeat."
-}
-────────────────────────────────────────
+• stack  — Stack (index 0 = TOP)
+  "diagram": {
+    "kind": "stack",
+    "items": [ { "value": "Top" }, { "value": "Middle" }, { "value": "Bottom" } ],
+    "rule": "LIFO — last item pushed is first popped"
+  }
 
-CRITICAL: When a tree node has only ONE child in the example, you
-MUST omit the missing child key entirely (don't put null, don't put
-an empty object). The renderer treats missing keys as "no child".
+• queue  — Queue (index 0 = FRONT)
+  "diagram": {
+    "kind": "queue",
+    "items": [ { "value": "Front" }, { "value": "Middle" }, { "value": "Back" } ],
+    "rule": "FIFO — first item enqueued is first dequeued"
+  }
 
+• graph  — Graph / Network
+  "diagram": {
+    "kind": "graph",
+    "nodes": [ { "id": "A" }, { "id": "B" }, { "id": "C" } ],
+    "edges": [
+      { "from": "A", "to": "B", "weight": "5" },
+      { "from": "B", "to": "C", "weight": "3" }
+    ],
+    "directed": false,
+    "rule": "Vertices connected by edges; edges may carry weights"
+  }
+
+• hashTable  — Hash Table
+  "diagram": {
+    "kind": "hashTable",
+    "buckets": [
+      { "index": 0, "items": [] },
+      { "index": 1, "items": [ { "value": "Alice" } ] },
+      { "index": 2, "items": [] }
+    ],
+    "rule": "hash(key) maps to a bucket; collisions chain in the same bucket"
+  }
+
+• ascii  — Use ONLY when none of the above fits the concept
+  "diagram": {
+    "kind": "ascii",
+    "text": "[Client] --> [Server] --> [Database]",
+    "rule": "Request flows left to right through each tier"
+  }
+
+════════════════════════════════════════
+SOLVED EXAMPLE SCHEMA
+════════════════════════════════════════
+The "solvedExample" field must be a worked problem structured exactly like:
+
+  "solvedExample": {
+    "question": "Insert 50, 30, 70 into an empty BST. Show the tree after each step.",
+    "steps": [
+      {
+        "title": "Step 1: Insert 50",
+        "explanation": "The tree is empty, so 50 becomes the root.",
+        "diagram": { "kind": "tree", "root": { "value": "50" }, "rule": "Root node" }
+      },
+      {
+        "title": "Step 2: Insert 30",
+        "explanation": "30 is less than 50, so it goes to the left of the root.",
+        "diagram": { "kind": "tree", "root": { "value": "50", "left": { "value": "30" } }, "rule": "30 < 50" }
+      },
+      {
+        "title": "Step 3: Insert 70",
+        "explanation": "70 is greater than 50, so it goes to the right of the root.",
+        "diagram": { "kind": "tree", "root": { "value": "50", "left": { "value": "30" }, "right": { "value": "70" } }, "rule": "70 > 50" }
+      }
+    ],
+    "finalAnswer": "The BST has root 50, with 30 on the left and 70 on the right.",
+    "beginnerTip": "Always compare with the current node: go left if smaller, go right if larger."
+  }
+
+Rules for solvedExample:
+- Use 3-6 steps maximum. Each step does ONE small thing.
+- Each step has a "title" (e.g. "Step 1: ..."), an "explanation" (1-2 beginner sentences),
+  and an optional "diagram" (full diagram object — omit the key entirely if no visual is needed).
+- If a step has a diagram, it must use one of the diagram kinds above — never use a string.
+- Keep the worked example small: at most 4 numbers / rows / processes.
+- "finalAnswer" is one short sentence.
+- "beginnerTip" is one short sentence — the key rule of thumb.
+
+════════════════════════════════════════
 CONCEPT: "${concept.name}"
 ${concept.summary ? `SHORT SUMMARY: "${concept.summary}"` : ""}
 
-CONTEXT (the meeting transcript / summary the concept came from — use this to tailor your explanation to what was actually discussed; ignore parts that aren't directly relevant to the concept):
+MEETING CONTEXT (use this to tailor the explanation to what was discussed;
+ignore parts that are not relevant to the concept above):
 ${trimmedContext || "(no additional context provided)"}
+
+Now produce the single JSON object. Start your response with { and end with }. Nothing else.
 `;
 
+  // ── Fetch ────────────────────────────────────────────────────────────────
+  // response_format:json_object is intentionally NOT sent here.
+  // Groq validates the entire prompt for JSON-compatibility when that flag
+  // is set, and the complex nested schema in the prompt above causes a 400
+  // before the model runs. extractJsonObject() handles all output formats
+  // (bare object, markdown fences, prose preamble, trailing commas).
   const res = await fetch(GROQ_ENDPOINT, {
     method: "POST",
     headers: {
@@ -1200,31 +1134,33 @@ ${trimmedContext || "(no additional context provided)"}
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      // `response_format: json_object` asks Groq for strict JSON.
-      // The endpoint accepts the same OpenAI-style flag, and even
-      // when it's silently ignored by an older model the
-      // extractJsonObject() fallback below still recovers the
-      // payload. Belt and braces.
-      response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
           content:
-            "You are a precise study-guide generator. Reply with a single JSON object only, no markdown, no preamble, no closing remarks.",
+            "You are a precise study-guide generator. Output a single JSON object only. " +
+            "Start with { and end with }. No markdown, no backticks, no preamble, no remarks.",
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.4,
-      // qwen/qwen3.6-27b supports up to 16 384 tokens.
-      // The concept payload (diagrams + solved example steps) needs ~2 500–3 500.
-      // 1600 was causing silent truncation on complex topics.
-      max_tokens: 4000,
+      // Lower temperature for more deterministic JSON structure.
+      temperature: 0.2,
+      // 3000 tokens is enough for the full concept payload.
+      // Keeping this lower than 4000 reduces TPM consumption.
+      max_tokens: 3000,
     }),
   });
+
   if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Groq ${res.status}: ${t.slice(0, 200)}`);
+    const errorText = await res.text().catch(() => "");
+    console.error("[ConceptDrawer] Groq API error:", {
+      status: res.status,
+      concept: concept?.name,
+      body: errorText,
+    });
+    throw new Error(`Groq ${res.status}: ${errorText.slice(0, 300)}`);
   }
+
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content || "";
 
